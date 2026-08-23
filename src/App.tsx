@@ -7,9 +7,10 @@ import { AudioPlayerControls } from './components/AudioPlayerControls';
 import { SubtitleTableEditor } from './components/SubtitleTableEditor';
 import { SrtPreviewExport } from './components/SrtPreviewExport';
 import { TapSyncModal } from './components/TapSyncModal';
+import { AlignmentProgressModal } from './components/AlignmentProgressModal';
 import { AudioTrackInfo, SubtitleCue, SyncMode } from './types';
 import { SAMPLE_LYRICS_PRESETS } from './data/sampleLyrics';
-import { prepareAudioForAi, extractWaveformPeaks, generateDemoSong } from './utils/audio';
+import { prepareAudioForAi, extractWaveformPeaks, generateDemoSong, alignLyricsToVocalSegments, AudioAnalysisResult } from './utils/audio';
 import { AlertCircle, CheckCircle2, Music2, Sparkles, HelpCircle } from 'lucide-react';
 
 export default function App() {
@@ -20,6 +21,7 @@ export default function App() {
 
   // Audio State
   const [audioInfo, setAudioInfo] = useState<AudioTrackInfo | null>(null);
+  const [lastAnalysis, setLastAnalysis] = useState<AudioAnalysisResult | null>(null);
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
   const [currentTime, setCurrentTime] = useState<number>(0);
   const [playbackRate, setPlaybackRate] = useState<number>(1.0);
@@ -33,6 +35,13 @@ export default function App() {
   const [isLoadingDemo, setIsLoadingDemo] = useState<boolean>(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successToast, setSuccessToast] = useState<string | null>(null);
+
+  // Progress Modal State
+  const [isProgressModalOpen, setIsProgressModalOpen] = useState<boolean>(false);
+  const [progressStep, setProgressStep] = useState<number>(1);
+  const [progressText, setProgressText] = useState<string>('Initializing audio engine...');
+  const [progressPercent, setProgressPercent] = useState<number>(10);
+  const [alignmentError, setAlignmentError] = useState<string | null>(null);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
@@ -187,6 +196,28 @@ export default function App() {
     }
   };
 
+  // Instant Vocal Energy Alignment (Client-side / Fallback)
+  const handleInstantVocalSync = () => {
+    if (!audioInfo?.duration) return;
+    if (parsedLines.length === 0) return;
+
+    const analysis = lastAnalysis || {
+      duration: audioInfo.duration,
+      sampleRate: 44100,
+      numberOfChannels: 2,
+      vocalSegments: [],
+      firstVocalOnset: 1.5,
+      lastVocalOffset: Math.max(2, audioInfo.duration - 1.5),
+      averagePhraseDuration: 3.2,
+    };
+
+    const syncedCues = alignLyricsToVocalSegments(parsedLines, analysis, audioInfo.duration, syncMode);
+    setCues(syncedCues);
+    setIsProgressModalOpen(false);
+    setSuccessToast(`Applied instant vocal sync across ${syncedCues.length} lines!`);
+    setTimeout(() => setSuccessToast(null), 3000);
+  };
+
   // AI Auto-Alignment
   const handleAutoAlign = async () => {
     if (!audioInfo?.blob) {
@@ -201,10 +232,24 @@ export default function App() {
 
     try {
       setIsAligning(true);
+      setAlignmentError(null);
       setErrorMessage(null);
+      setIsProgressModalOpen(true);
+      setProgressStep(1);
+      setProgressText("Reading & decoding WAV audio buffer...");
+      setProgressPercent(15);
 
-      // Downsample to 16kHz mono WAV base64 for fast transfer
-      const prep = await prepareAudioForAi(audioInfo.blob);
+      // Downsample to 16kHz mono WAV base64 for fast transfer & run vocal activity analysis
+      const prep = await prepareAudioForAi(audioInfo.blob, (status, pct) => {
+        setProgressText(status);
+        setProgressPercent(pct);
+        if (pct >= 35) setProgressStep(2);
+      });
+
+      setLastAnalysis(prep.analysis);
+      setProgressStep(3);
+      setProgressText(`Connecting to AI synchronizer (${parsedLines.length} lines)...`);
+      setProgressPercent(70);
 
       const response = await fetch("/api/align-lyrics", {
         method: "POST",
@@ -216,8 +261,13 @@ export default function App() {
           lines: parsedLines,
           mode: syncMode,
           audioDuration: audioInfo.duration,
+          analysis: prep.analysis,
         }),
       });
+
+      setProgressStep(4);
+      setProgressText("Validating timestamp boundaries & verbatim lines...");
+      setProgressPercent(95);
 
       const data = await response.json();
 
@@ -226,26 +276,35 @@ export default function App() {
       }
 
       setCues(data.items);
-      setSuccessToast(`Successfully aligned all ${data.items.length} lines with Gemini AI!`);
-      setTimeout(() => setSuccessToast(null), 4000);
+      setProgressPercent(100);
+
+      setTimeout(() => {
+        setIsProgressModalOpen(false);
+        if (data.source === 'vocal_energy' || data.warning) {
+          setSuccessToast(`Aligned ${data.items.length} lines using acoustic vocal onset detection!`);
+        } else {
+          setSuccessToast(`Successfully aligned all ${data.items.length} lines with Gemini AI!`);
+        }
+        setTimeout(() => setSuccessToast(null), 4000);
+      }, 500);
     } catch (err: any) {
       console.error("Auto align error:", err);
-      setErrorMessage(err.message || "An error occurred during AI alignment. You can also use Vibe Tap-to-Sync!");
+      setAlignmentError(err.message || "An error occurred during AI alignment.");
       
-      // Fallback: create evenly distributed cues so the user is never blocked
-      const fallbackCues: SubtitleCue[] = parsedLines.map((line, i) => {
-        const step = audioInfo.duration / Math.max(parsedLines.length, 1);
-        const start = i * step;
-        const end = (i + 1) * step;
-        return {
-          id: `fallback-${i + 1}`,
-          index: i + 1,
-          text: line,
-          startTime: +start.toFixed(3),
-          endTime: +end.toFixed(3),
+      // Fallback: create vocal segment distributed cues so the user is never blocked
+      if (audioInfo?.duration) {
+        const fallbackAnalysis = lastAnalysis || {
+          duration: audioInfo.duration,
+          sampleRate: 44100,
+          numberOfChannels: 2,
+          vocalSegments: [],
+          firstVocalOnset: 1.5,
+          lastVocalOffset: Math.max(2, audioInfo.duration - 1.5),
+          averagePhraseDuration: 3.2,
         };
-      });
-      setCues(fallbackCues);
+        const fallbackCues = alignLyricsToVocalSegments(parsedLines, fallbackAnalysis, audioInfo.duration, syncMode);
+        setCues(fallbackCues);
+      }
     } finally {
       setIsAligning(false);
     }
@@ -295,19 +354,70 @@ export default function App() {
     setTimeout(() => setSuccessToast(null), 2500);
   };
 
+  // Acoustic snapping to detected vocal segments
+  const handleSnapToAcousticPeaks = () => {
+    if (!audioInfo?.analysis?.vocalSegments || audioInfo.analysis.vocalSegments.length === 0) {
+      setErrorMessage("No acoustic vocal segments detected in the audio file yet.");
+      return;
+    }
+
+    const segments = audioInfo.analysis.vocalSegments;
+    setCues((prev) =>
+      prev.map((c) => {
+        let start = c.startTime;
+        let end = c.endTime;
+
+        const closestStart = segments.find((s) => Math.abs(s.startTime - c.startTime) < 0.45);
+        if (closestStart) start = closestStart.startTime;
+
+        const closestEnd = segments.find((s) => Math.abs(s.endTime - c.endTime) < 0.45);
+        if (closestEnd) end = closestEnd.endTime;
+
+        if (end <= start) end = +(start + 1.8).toFixed(3);
+
+        return {
+          ...c,
+          startTime: +start.toFixed(3),
+          endTime: +end.toFixed(3),
+        };
+      })
+    );
+    setSuccessToast("Snapped subtitle boundaries to acoustic vocal onsets!");
+    setTimeout(() => setSuccessToast(null), 2500);
+  };
+
+  // Clean sequential overlaps
+  const handleRemoveOverlaps = () => {
+    setCues((prev) => {
+      let lastEnd = 0;
+      return prev.map((c) => {
+        let start = Math.max(c.startTime, lastEnd > 0 ? lastEnd + 0.05 : 0);
+        let end = Math.max(c.endTime, start + 0.5);
+        lastEnd = end;
+        return {
+          ...c,
+          startTime: +start.toFixed(3),
+          endTime: +end.toFixed(3),
+        };
+      });
+    });
+    setSuccessToast("Fixed and formatted all subtitle overlaps!");
+    setTimeout(() => setSuccessToast(null), 2500);
+  };
+
   // Reset workspace
   const handleReset = () => {
-    if (window.confirm("Reset all lyrics, audio, and subtitle timestamps?")) {
-      setCues([]);
-      setAudioInfo(null);
-      setCurrentTime(0);
-      setIsPlaying(false);
-      setLyricsText(SAMPLE_LYRICS_PRESETS[0].text);
-      if (audioRef.current) {
-        audioRef.current.pause();
-        audioRef.current.src = "";
-      }
+    setCues([]);
+    setAudioInfo(null);
+    setCurrentTime(0);
+    setIsPlaying(false);
+    setLyricsText(SAMPLE_LYRICS_PRESETS[0].text);
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current.src = "";
     }
+    setSuccessToast("Workspace reset to initial state");
+    setTimeout(() => setSuccessToast(null), 2500);
   };
 
   // Global Keyboard shortcuts
@@ -399,6 +509,7 @@ export default function App() {
               syncMode={syncMode}
               onSyncModeChange={setSyncMode}
               onAutoAlign={handleAutoAlign}
+              onInstantAcousticSync={handleInstantVocalSync}
               onStartTapSync={() => setIsTapSyncOpen(true)}
               isAligning={isAligning}
               audioLoaded={!!audioInfo}
@@ -474,6 +585,8 @@ export default function App() {
               onPlayCue={handlePlayCue}
               onSetCueToCurrentTime={handleSetCueToCurrentTime}
               onShiftAllTimestamps={handleShiftAllTimestamps}
+              onSnapToAcousticPeaks={handleSnapToAcousticPeaks}
+              onRemoveOverlaps={handleRemoveOverlaps}
             />
 
           </div>
@@ -481,6 +594,19 @@ export default function App() {
         </div>
 
       </main>
+
+      {/* AI Alignment Progress & Diagnostic Modal */}
+      <AlignmentProgressModal
+        isOpen={isProgressModalOpen}
+        step={progressStep}
+        statusText={progressText}
+        percent={progressPercent}
+        lineCount={lineCount}
+        audioDuration={audioInfo?.duration || 0}
+        error={alignmentError}
+        onClose={() => setIsProgressModalOpen(false)}
+        onUseFallbackVocalSync={handleInstantVocalSync}
+      />
 
       {/* Vibe Tap-to-Sync Fullscreen Modal */}
       <TapSyncModal

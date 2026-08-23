@@ -12,6 +12,8 @@ interface SubtitleTableEditorProps {
   onPlayCue: (cue: SubtitleCue) => void;
   onSetCueToCurrentTime: (index: number, type: 'start' | 'end') => void;
   onShiftAllTimestamps: (offsetSeconds: number) => void;
+  onSnapToAcousticPeaks?: () => void;
+  onRemoveOverlaps?: () => void;
 }
 
 export const SubtitleTableEditor: React.FC<SubtitleTableEditorProps> = ({
@@ -23,6 +25,8 @@ export const SubtitleTableEditor: React.FC<SubtitleTableEditorProps> = ({
   onPlayCue,
   onSetCueToCurrentTime,
   onShiftAllTimestamps,
+  onSnapToAcousticPeaks,
+  onRemoveOverlaps,
 }) => {
   const [shiftValue, setShiftValue] = useState<string>('0.5');
   const [expandedWordCueIndex, setExpandedWordCueIndex] = useState<number | null>(null);
@@ -70,31 +74,57 @@ export const SubtitleTableEditor: React.FC<SubtitleTableEditorProps> = ({
           </span>
         </div>
 
-        {/* Global Time Shift Tool */}
-        <div className="flex items-center gap-1.5 text-xs bg-zinc-900 px-2.5 py-1.5 rounded-xl border border-zinc-800">
-          <span className="text-zinc-400 font-medium">Shift all:</span>
-          <button
-            onClick={() => handleApplyShift(-1)}
-            className="px-2 py-0.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300 font-mono font-bold"
-            title="Shift all cues earlier"
-          >
-            -{shiftValue}s
-          </button>
-          <input
-            type="number"
-            value={shiftValue}
-            step="0.1"
-            min="0.1"
-            onChange={(e) => setShiftValue(e.target.value)}
-            className="w-12 text-center bg-zinc-950 border border-zinc-700 rounded px-1 text-zinc-200 font-mono text-xs"
-          />
-          <button
-            onClick={() => handleApplyShift(1)}
-            className="px-2 py-0.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300 font-mono font-bold"
-            title="Shift all cues later"
-          >
-            +{shiftValue}s
-          </button>
+        <div className="flex flex-wrap items-center gap-2">
+          {/* Quick Vocal Energy Snap Button */}
+          {onSnapToAcousticPeaks && (
+            <button
+              id="btn-snap-vocal-energy"
+              onClick={onSnapToAcousticPeaks}
+              className="px-2.5 py-1 rounded-xl bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 hover:border-cyan-500/40 text-zinc-300 hover:text-cyan-300 text-xs font-medium flex items-center gap-1 transition-all"
+              title="Snap start/end boundaries to closest vocal audio bursts"
+            >
+              <span>🧲 Snap to Onsets</span>
+            </button>
+          )}
+
+          {/* Clean Overlaps Button */}
+          {onRemoveOverlaps && (
+            <button
+              id="btn-remove-overlaps"
+              onClick={onRemoveOverlaps}
+              className="px-2.5 py-1 rounded-xl bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 hover:border-emerald-500/40 text-zinc-300 hover:text-emerald-300 text-xs font-medium flex items-center gap-1 transition-all"
+              title="Ensure no subtitle cue overlaps the subsequent line"
+            >
+              <span>✨ Fix Overlaps</span>
+            </button>
+          )}
+
+          {/* Global Time Shift Tool */}
+          <div className="flex items-center gap-1.5 text-xs bg-zinc-900 px-2.5 py-1 rounded-xl border border-zinc-800">
+            <span className="text-zinc-400 font-medium">Shift:</span>
+            <button
+              onClick={() => handleApplyShift(-1)}
+              className="px-1.5 py-0.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300 font-mono font-bold"
+              title="Shift all cues earlier"
+            >
+              -{shiftValue}s
+            </button>
+            <input
+              type="number"
+              value={shiftValue}
+              step="0.1"
+              min="0.1"
+              onChange={(e) => setShiftValue(e.target.value)}
+              className="w-12 text-center bg-zinc-950 border border-zinc-700 rounded px-1 text-zinc-200 font-mono text-xs"
+            />
+            <button
+              onClick={() => handleApplyShift(1)}
+              className="px-1.5 py-0.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300 font-mono font-bold"
+              title="Shift all cues later"
+            >
+              +{shiftValue}s
+            </button>
+          </div>
         </div>
       </div>
 

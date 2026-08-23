@@ -44,6 +44,7 @@ app.post("/api/align-lyrics", async (req, res) => {
       lines,
       mode = "line",
       audioDuration,
+      analysis,
     } = req.body;
 
     if (!audioBase64) {
@@ -66,113 +67,185 @@ app.post("/api/align-lyrics", async (req, res) => {
       return res.status(400).json({ error: "No valid lyric lines provided." });
     }
 
-    const ai = getGeminiClient();
-
     const isWordMode = mode === "word";
     const approxDuration = typeof audioDuration === "number" && audioDuration > 0 ? audioDuration : 180;
+    const vocalSegments = Array.isArray(analysis?.vocalSegments) ? analysis.vocalSegments : [];
+    const firstOnset = analysis?.firstVocalOnset ? `${analysis.firstVocalOnset.toFixed(2)}s` : "0.5s";
+    const lastOffset = analysis?.lastVocalOffset ? `${analysis.lastVocalOffset.toFixed(2)}s` : `${approxDuration.toFixed(1)}s`;
 
-    const systemInstruction = `You are a precision audio engineer and master lyric-to-audio subtitle synchronizer.
-Your task is to analyze the provided audio track and align the user's EXACT lyrics to the audio timestamps.
+    let alignedItems: any[] = [];
+    let alignmentSource: "gemini_ai" | "vocal_energy" = "gemini_ai";
+    let warningNote: string | undefined;
 
-CRITICAL RULES:
-1. You MUST output EXACTLY ${inputLines.length} subtitle items corresponding to each of the ${inputLines.length} lines provided in the input, in the exact same order.
-2. The subtitle text MUST match the input lines verbatim. Do not omit lines, invent lines, merge lines, or change any words.
-3. Determine accurate start time (startTime) and end time (endTime) in seconds (floating point numbers, e.g. 1.25, 4.80) for when each line is sung or spoken in the audio.
-4. If the audio has instrumental intros or outros, start timestamps should accurately reflect when vocals start.
-5. All timestamps must be in ascending chronological order, within the total audio duration (approx ${approxDuration.toFixed(1)}s).
-${isWordMode ? "6. In 'word' mode, additionally provide the 'words' array for each line with the exact timestamp start and end for every word in that line." : ""}
+    try {
+      const ai = getGeminiClient();
+
+      const systemInstruction = `You are an elite, millisecond-precision audio engineer and professional lyric-to-audio subtitle synchronizer (SRT/LRC specialist).
+Your mission is to listen to the attached audio recording and accurately pin-point the EXACT millisecond timestamps when each given lyric line is sung or spoken.
+
+PRECISION GUIDELINES:
+1. STRICT SEQUENCE & COUNT: You MUST return EXACTLY ${inputLines.length} subtitle items in the exact 1-to-1 order of the input lines. Do not combine, skip, invent, or rephrase words.
+2. ACCURATE ONSET & RELEASE:
+   - 'startTime': The exact second the vocalist begins voicing the very first phoneme/consonant of the line.
+   - 'endTime': The exact second the vocalist releases the final syllable/vowel sound of the line.
+3. SILENCE & INSTRUMENTAL HANDLING: If there is an instrumental intro (e.g. before ~${firstOnset}), guitar solo, or musical interlude between verses/choruses, the timestamps MUST pause and accurately reflect the silence. Do NOT stretch lines across long musical breaks.
+4. Vocal energy in this track is actively detected between ~${firstOnset} and ~${lastOffset}.
+5. MONOTONIC CHRONOLOGY: All timestamps must be strictly sequential (0.000 <= startTime < endTime <= ${approxDuration.toFixed(2)}s).
+${isWordMode ? "6. WORD-BY-WORD PRECISION: For each line, output the 'words' array with precise start and end times for every single word." : ""}
 `;
 
-    const userPrompt = `Here are the exact ${inputLines.length} lines of lyrics that must be synced to the audio track:
-${inputLines.map((line, idx) => `Line ${idx + 1}: "${line}"`).join("\n")}
+      const userPrompt = `Here is the audio file (~${approxDuration.toFixed(2)}s duration) and the exact ${inputLines.length} lines of text to synchronize:
 
-Total Audio Duration: ~${approxDuration.toFixed(1)} seconds.
-Alignment Mode: ${isWordMode ? "Word-by-Word + Line-by-Line" : "Line-by-Line (1 cue per line)"}.
+LYRIC LINES:
+${inputLines.map((line, idx) => `[Line ${idx + 1}] ${line}`).join("\n")}
 
-Please listen to the attached audio file and produce the timestamps for all ${inputLines.length} lines.`;
+Please listen carefully to the vocal track, identify when each specific line is vocalized, and return the precise timestamps in the structured JSON format.`;
 
-    const audioPart = {
-      inlineData: {
-        mimeType: mimeType.includes("wav") ? "audio/wav" : mimeType.includes("mp3") || mimeType.includes("mpeg") ? "audio/mp3" : mimeType,
-        data: audioBase64,
-      },
-    };
+      const audioPart = {
+        inlineData: {
+          mimeType: mimeType.includes("wav") ? "audio/wav" : mimeType.includes("mp3") || mimeType.includes("mpeg") ? "audio/mp3" : mimeType,
+          data: audioBase64,
+        },
+      };
 
-    // Schema for structured JSON response
-    const wordSchema = {
-      type: Type.OBJECT,
-      properties: {
-        word: { type: Type.STRING, description: "The word text" },
-        startTime: { type: Type.NUMBER, description: "Start time in seconds" },
-        endTime: { type: Type.NUMBER, description: "End time in seconds" },
-      },
-      required: ["word", "startTime", "endTime"],
-    };
+      const wordSchema = {
+        type: Type.OBJECT,
+        properties: {
+          word: { type: Type.STRING, description: "The word text" },
+          startTime: { type: Type.NUMBER, description: "Start time in seconds" },
+          endTime: { type: Type.NUMBER, description: "End time in seconds" },
+        },
+        required: ["word", "startTime", "endTime"],
+      };
 
-    const itemSchema = {
-      type: Type.OBJECT,
-      properties: {
-        index: { type: Type.INTEGER, description: "1-based line index" },
-        text: { type: Type.STRING, description: "The lyric line verbatim" },
-        startTime: { type: Type.NUMBER, description: "Line start time in seconds (float)" },
-        endTime: { type: Type.NUMBER, description: "Line end time in seconds (float)" },
-        ...(isWordMode
-          ? {
-              words: {
-                type: Type.ARRAY,
-                items: wordSchema,
-                description: "Individual word timestamps for this line",
+      const itemSchema = {
+        type: Type.OBJECT,
+        properties: {
+          index: { type: Type.INTEGER, description: "1-based line index" },
+          text: { type: Type.STRING, description: "The lyric line verbatim" },
+          startTime: { type: Type.NUMBER, description: "Line start time in seconds (float)" },
+          endTime: { type: Type.NUMBER, description: "Line end time in seconds (float)" },
+          ...(isWordMode
+            ? {
+                words: {
+                  type: Type.ARRAY,
+                  items: wordSchema,
+                  description: "Individual word timestamps for this line",
+                },
+              }
+            : {}),
+        },
+        required: ["index", "text", "startTime", "endTime"],
+      };
+
+      const candidateModels = ["gemini-3.7-flash", "gemini-flash-latest", "gemini-3.1-flash-lite"];
+      let response: any = null;
+      let lastAiError: any = null;
+
+      for (const modelName of candidateModels) {
+        try {
+          console.log(`Attempting lyric alignment with model: ${modelName}`);
+          response = await ai.models.generateContent({
+            model: modelName,
+            contents: [
+              {
+                role: "user",
+                parts: [audioPart, { text: userPrompt }],
               },
-            }
-          : {}),
-      },
-      required: ["index", "text", "startTime", "endTime"],
-    };
+            ],
+            config: {
+              systemInstruction,
+              responseMimeType: "application/json",
+              responseSchema: {
+                type: Type.ARRAY,
+                items: itemSchema,
+              },
+              temperature: 0.1,
+              maxOutputTokens: 8192,
+            },
+          });
 
-    const response = await ai.models.generateContent({
-      model: "gemini-3.7-flash",
-      contents: [
-        {
-          role: "user",
-          parts: [audioPart, { text: userPrompt }],
-        },
-      ],
-      config: {
-        systemInstruction,
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.ARRAY,
-          items: itemSchema,
-        },
-        temperature: 0.1,
-      },
-    });
+          if (response && response.text) {
+            console.log(`Successfully received alignment from model: ${modelName}`);
+            break;
+          }
+        } catch (modelErr: any) {
+          console.warn(`Model ${modelName} attempt failed:`, modelErr?.message || modelErr);
+          lastAiError = modelErr;
+        }
+      }
 
-    const responseText = response.text || "[]";
-    let alignedItems: any[] = [];
-    try {
-      alignedItems = JSON.parse(responseText);
-    } catch (parseErr) {
-      console.error("Failed to parse Gemini response as JSON:", responseText);
-      return res.status(500).json({ error: "AI response could not be parsed as valid JSON." });
+      if (response && response.text) {
+        const responseText = response.text || "[]";
+        alignedItems = JSON.parse(responseText);
+        alignmentSource = "gemini_ai";
+      } else {
+        throw lastAiError || new Error("All Gemini models temporarily unavailable.");
+      }
+    } catch (aiErr: any) {
+      console.warn("Gemini alignment encountered an issue, applying vocal energy alignment:", aiErr?.message || aiErr);
+      alignmentSource = "vocal_energy";
+      warningNote = "AI cloud sync fell back to acoustic vocal onset detection for instant alignment.";
     }
 
-    // Post-process to guarantee EXACT line matching and line count integrity
+    // Post-process to guarantee EXACT line matching, chronological sanity, and acoustic boundary snapping
+    const firstOnsetSec = analysis?.firstVocalOnset || 1.0;
+    const lastOffsetSec = analysis?.lastVocalOffset || Math.max(2, approxDuration - 1.0);
+    const usableSpan = Math.max(1, lastOffsetSec - firstOnsetSec);
+    const avgStep = usableSpan / inputLines.length;
+
+    let previousEnd = 0;
+
     const finalItems = inputLines.map((originalText, i) => {
       const match = alignedItems[i] || alignedItems.find((item: any) => item.index === i + 1);
-      
-      let start = match && typeof match.startTime === "number" ? Math.max(0, match.startTime) : (approxDuration / inputLines.length) * i;
-      let end = match && typeof match.endTime === "number" ? Math.min(approxDuration, match.endTime) : (approxDuration / inputLines.length) * (i + 0.9);
 
-      if (end <= start) {
-        end = start + 2.0;
+      let rawStart: number;
+      let rawEnd: number;
+
+      if (match && typeof match.startTime === "number" && typeof match.endTime === "number") {
+        rawStart = Math.max(0, match.startTime);
+        rawEnd = Math.min(approxDuration, match.endTime);
+      } else {
+        // Vocal energy onset mapping fallback
+        const targetTime = firstOnsetSec + i * avgStep;
+        const nearestSeg = vocalSegments.find(
+          (s: any) => Math.abs(s.startTime - targetTime) < avgStep * 0.75
+        );
+        rawStart = nearestSeg ? nearestSeg.startTime : targetTime;
+        rawEnd = nearestSeg ? Math.min(approxDuration, nearestSeg.endTime + 0.25) : Math.min(approxDuration, rawStart + avgStep * 0.85);
       }
+
+      // Micro-snap start and end to physical vocal onsets if within 0.4s
+      let start = rawStart;
+      let end = rawEnd;
+
+      if (vocalSegments.length > 0) {
+        const closestStartSeg = vocalSegments.find((s: any) => Math.abs(s.startTime - rawStart) < 0.35);
+        if (closestStartSeg) {
+          start = closestStartSeg.startTime;
+        }
+
+        const closestEndSeg = vocalSegments.find((s: any) => Math.abs(s.endTime - rawEnd) < 0.35);
+        if (closestEndSeg) {
+          end = closestEndSeg.endTime;
+        }
+      }
+
+      // Guarantee minimum duration and avoid overlap with previous cue if too tight
+      if (start < previousEnd && previousEnd > 0) {
+        start = Math.max(start, previousEnd + 0.05);
+      }
+      if (end <= start) {
+        end = Math.min(approxDuration, start + 1.8);
+      }
+
+      previousEnd = end;
 
       const words = isWordMode && Array.isArray(match?.words) && match.words.length > 0
         ? match.words.map((w: any) => ({
             word: String(w.word || ""),
-            startTime: Number(w.startTime || start),
-            endTime: Number(w.endTime || end),
+            startTime: +(Number(w.startTime) || start).toFixed(3),
+            endTime: +(Number(w.endTime) || end).toFixed(3),
           }))
         : originalText.split(/\s+/).filter(Boolean).map((word, wIdx, arr) => {
             const span = (end - start) / Math.max(arr.length, 1);
@@ -184,7 +257,7 @@ Please listen to the attached audio file and produce the timestamps for all ${in
           });
 
       return {
-        id: `cue-${i + 1}-${Date.now()}`,
+        id: `cue-${i + 1}-${Date.now()}-${i}`,
         index: i + 1,
         text: originalText,
         startTime: +start.toFixed(3),
@@ -198,6 +271,8 @@ Please listen to the attached audio file and produce the timestamps for all ${in
       items: finalItems,
       lineCount: finalItems.length,
       mode,
+      source: alignmentSource,
+      warning: warningNote,
     });
   } catch (error: any) {
     console.error("Error in /api/align-lyrics:", error);

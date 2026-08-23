@@ -1,6 +1,10 @@
 {
   "name": "LyricSRT - Audio to SRT Sync Studio",
   "description": "Align WAV audio and lyric text line-by-line or word-by-word into timed SRT subtitle files using AI audio sync and interactive tap-to-sync.",
-  "requestFramePermissions": ["microphone"],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }
