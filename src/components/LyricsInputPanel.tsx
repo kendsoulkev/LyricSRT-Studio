@@ -1,6 +1,6 @@
 import React, { useMemo } from 'react';
-import { AlignLeft, Sparkles, Radio, Trash2, ListOrdered, FileText, CheckCircle, Flame } from 'lucide-react';
-import { SyncMode } from '../types';
+import { AlignLeft, Sparkles, Radio, Trash2, ListOrdered, FileText, CheckCircle, Flame, Anchor } from 'lucide-react';
+import { SyncMode, FirstLineAnchor } from '../types';
 import { SAMPLE_LYRICS_PRESETS, LyricPreset } from '../data/sampleLyrics';
 
 interface LyricsInputPanelProps {
@@ -15,6 +15,10 @@ interface LyricsInputPanelProps {
   audioLoaded: boolean;
   cleanEmptyLines: boolean;
   onToggleCleanEmptyLines: () => void;
+  initialAlignmentDone?: boolean;
+  firstLineManuallySet?: boolean;
+  firstLineAnchor?: FirstLineAnchor | null;
+  onAutoAlignWithAnchor?: () => void;
 }
 
 export const LyricsInputPanel: React.FC<LyricsInputPanelProps> = ({
@@ -29,6 +33,10 @@ export const LyricsInputPanel: React.FC<LyricsInputPanelProps> = ({
   audioLoaded,
   cleanEmptyLines,
   onToggleCleanEmptyLines,
+  initialAlignmentDone = false,
+  firstLineManuallySet = false,
+  firstLineAnchor,
+  onAutoAlignWithAnchor,
 }) => {
   // Compute active lines based on settings
   const parsedLines = useMemo(() => {
@@ -189,6 +197,32 @@ export const LyricsInputPanel: React.FC<LyricsInputPanelProps> = ({
             {syncMode === 'line' ? `${lineCount} SRT cues` : `~${wordCount} word cues`}
           </span>
         </div>
+
+        {/* Guided AI Re-Align with Line 1 Anchor Button (Only active when initial alignment is completed & Line 1 is anchored) */}
+        {initialAlignmentDone && (firstLineManuallySet || Boolean(firstLineAnchor)) && lineCount > 1 && onAutoAlignWithAnchor && (
+          <div className="p-2.5 rounded-xl bg-amber-950/30 border border-amber-500/40 space-y-2 animate-in fade-in">
+            <button
+              id="btn-auto-align-with-anchor-panel"
+              onClick={onAutoAlignWithAnchor}
+              disabled={isAligning || !audioLoaded}
+              className={`w-full py-2.5 px-4 rounded-xl font-bold text-xs sm:text-sm flex items-center justify-center gap-2 transition-all shadow-lg ${
+                isAligning
+                  ? 'bg-zinc-800 text-zinc-400 cursor-not-allowed'
+                  : 'bg-gradient-to-r from-amber-500 via-amber-400 to-cyan-400 hover:from-amber-400 hover:to-cyan-300 text-zinc-950 shadow-amber-500/20 active:scale-[0.98]'
+              }`}
+            >
+              <Anchor className="w-4 h-4 text-zinc-950" />
+              <span>
+                {isAligning
+                  ? 'Re-Aligning from Anchor...'
+                  : `AI Re-Align Lines 2–${lineCount} (Line 1 Guide Anchor)`}
+              </span>
+            </button>
+            <p className="text-[10px] text-amber-300/90 text-center font-mono leading-tight">
+              Line 1 locked ({firstLineAnchor ? `${firstLineAnchor.startTime.toFixed(2)}s - ${firstLineAnchor.endTime.toFixed(2)}s` : 'Manually set'}). All other lines will align after Line 1.
+            </p>
+          </div>
+        )}
 
         {/* Primary Action Buttons */}
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">

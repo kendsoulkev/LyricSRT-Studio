@@ -151,7 +151,8 @@ export function analyzeVocalActivity(buffer: AudioBuffer): AudioAnalysisResult {
     });
   }
 
-  const firstVocalOnset = segments.length > 0 ? segments[0].startTime : 1.5;
+  const firstSignificantSegment = segments.find(s => s.energy >= 0.15 && (s.endTime - s.startTime) >= 0.28) || segments[0];
+  const firstVocalOnset = firstSignificantSegment ? firstSignificantSegment.startTime : 1.5;
   const lastVocalOffset = segments.length > 0 ? segments[segments.length - 1].endTime : Math.max(2, duration - 1.5);
   
   const avgPhraseDuration = segments.length > 0
@@ -210,16 +211,34 @@ export function alignLyricsToVocalSegments(
     start = Math.max(0, start);
     end = Math.min(totalDuration, end);
 
-    const words = mode === 'word'
-      ? text.split(/\s+/).filter(Boolean).map((w, wIdx, arr) => {
-          const wSpan = (end - start) / Math.max(arr.length, 1);
+    let words = undefined;
+    if (mode === 'word') {
+      const rawWords = text.split(/\s+/).filter(Boolean);
+      if (rawWords.length > 0) {
+        const weights = rawWords.map((w) => {
+          const clean = w.toLowerCase().replace(/[^a-z0-9]/g, '');
+          const vowels = clean.match(/[aeiouy]{1,2}/g);
+          let syl = vowels ? vowels.length : 1;
+          if (clean.endsWith('e') && !clean.endsWith('le') && syl > 1) syl -= 1;
+          return Math.max(1, syl);
+        });
+        const totalW = weights.reduce((a, b) => a + b, 0);
+        const lineDuration = end - start;
+
+        let wCurrent = start;
+        words = rawWords.map((w, wIdx) => {
+          const span = (weights[wIdx] / totalW) * lineDuration;
+          const wStart = wCurrent;
+          const wEnd = wIdx === rawWords.length - 1 ? end : wCurrent + span;
+          wCurrent = wEnd;
           return {
             word: w,
-            startTime: +(start + wIdx * wSpan).toFixed(3),
-            endTime: +(start + (wIdx + 1) * wSpan).toFixed(3),
+            startTime: +wStart.toFixed(3),
+            endTime: +wEnd.toFixed(3),
           };
-        })
-      : undefined;
+        });
+      }
+    }
 
     return {
       id: `cue-${i + 1}-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,

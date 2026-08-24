@@ -1,6 +1,6 @@
 import React, { useState, useMemo } from 'react';
 import { SubtitleCue, SyncMode, ExportFormat } from '../types';
-import { generateSrt, generateVtt, generateLrc, triggerDownload, formatDisplayTime } from '../utils/srt';
+import { generateSrt, generateVtt, generateLrc, generateAss, triggerDownload, formatDisplayTime } from '../utils/srt';
 import { Download, Copy, Check, FileText, MonitorPlay, Code2, Sparkles, CheckCircle2 } from 'lucide-react';
 
 interface SrtPreviewExportProps {
@@ -34,6 +34,8 @@ export const SrtPreviewExport: React.FC<SrtPreviewExportProps> = ({
         return generateVtt(cues, syncMode);
       case 'lrc':
         return generateLrc(cues, audioName);
+      case 'ass':
+        return generateAss(cues, audioName);
       case 'json':
         return JSON.stringify(cues, null, 2);
       default:
@@ -61,6 +63,8 @@ export const SrtPreviewExport: React.FC<SrtPreviewExportProps> = ({
       mime = 'application/x-subrip';
     } else if (exportFormat === 'vtt') {
       mime = 'text/vtt';
+    } else if (exportFormat === 'ass') {
+      mime = 'text/x-ssa';
     } else if (exportFormat === 'json') {
       mime = 'application/json';
     }
@@ -127,6 +131,7 @@ export const SrtPreviewExport: React.FC<SrtPreviewExportProps> = ({
             <option value="srt">SubRip (.SRT)</option>
             <option value="vtt">WebVTT (.VTT)</option>
             <option value="lrc">Karaoke (.LRC)</option>
+            <option value="ass">Karaoke ASS (.ASS)</option>
             <option value="json">JSON Timestamps</option>
           </select>
 

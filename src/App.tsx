@@ -8,7 +8,7 @@ import { SubtitleTableEditor } from './components/SubtitleTableEditor';
 import { SrtPreviewExport } from './components/SrtPreviewExport';
 import { TapSyncModal } from './components/TapSyncModal';
 import { AlignmentProgressModal } from './components/AlignmentProgressModal';
-import { AudioTrackInfo, SubtitleCue, SyncMode } from './types';
+import { AudioTrackInfo, SubtitleCue, SyncMode, FirstLineAnchor } from './types';
 import { SAMPLE_LYRICS_PRESETS } from './data/sampleLyrics';
 import { prepareAudioForAi, extractWaveformPeaks, generateDemoSong, alignLyricsToVocalSegments, AudioAnalysisResult } from './utils/audio';
 import { AlertCircle, CheckCircle2, Music2, Sparkles, HelpCircle } from 'lucide-react';
@@ -35,6 +35,12 @@ export default function App() {
   const [isLoadingDemo, setIsLoadingDemo] = useState<boolean>(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successToast, setSuccessToast] = useState<string | null>(null);
+
+  // Guided Alignment & First-Line Anchor State
+  const [initialAlignmentDone, setInitialAlignmentDone] = useState<boolean>(false);
+  const [firstLineManuallySet, setFirstLineManuallySet] = useState<boolean>(false);
+  const [firstLineAnchor, setFirstLineAnchor] = useState<FirstLineAnchor | null>(null);
+  const [activeModalAnchor, setActiveModalAnchor] = useState<FirstLineAnchor | null>(null);
 
   // Progress Modal State
   const [isProgressModalOpen, setIsProgressModalOpen] = useState<boolean>(false);
@@ -213,12 +219,13 @@ export default function App() {
 
     const syncedCues = alignLyricsToVocalSegments(parsedLines, analysis, audioInfo.duration, syncMode);
     setCues(syncedCues);
+    setInitialAlignmentDone(true);
     setIsProgressModalOpen(false);
     setSuccessToast(`Applied instant vocal sync across ${syncedCues.length} lines!`);
     setTimeout(() => setSuccessToast(null), 3000);
   };
 
-  // AI Auto-Alignment
+  // Standard AI Auto-Alignment
   const handleAutoAlign = async () => {
     if (!audioInfo?.blob) {
       setErrorMessage("Please upload a WAV audio file or load the demo track first.");
@@ -234,6 +241,7 @@ export default function App() {
       setIsAligning(true);
       setAlignmentError(null);
       setErrorMessage(null);
+      setActiveModalAnchor(null);
       setIsProgressModalOpen(true);
       setProgressStep(1);
       setProgressText("Reading & decoding WAV audio buffer...");
@@ -276,6 +284,9 @@ export default function App() {
       }
 
       setCues(data.items);
+      setInitialAlignmentDone(true);
+      setFirstLineManuallySet(false);
+      setFirstLineAnchor(null);
       setProgressPercent(100);
 
       setTimeout(() => {
@@ -304,10 +315,118 @@ export default function App() {
         };
         const fallbackCues = alignLyricsToVocalSegments(parsedLines, fallbackAnalysis, audioInfo.duration, syncMode);
         setCues(fallbackCues);
+        setInitialAlignmentDone(true);
       }
     } finally {
       setIsAligning(false);
     }
+  };
+
+  // Guided AI Auto-Alignment with Manual First-Line Anchor
+  const handleAutoAlignWithAnchor = async () => {
+    if (!audioInfo?.blob) {
+      setErrorMessage("Please upload a WAV audio file or load the demo track first.");
+      return;
+    }
+
+    if (parsedLines.length < 2) {
+      setErrorMessage("Please enter at least 2 lines of lyric text to use Line 1 guided alignment.");
+      return;
+    }
+
+    if (cues.length === 0) {
+      setErrorMessage("Please perform initial AI alignment first before using Line 1 as a guide.");
+      return;
+    }
+
+    const anchorToUse: FirstLineAnchor = firstLineAnchor || {
+      startTime: cues[0].startTime,
+      endTime: cues[0].endTime,
+      text: cues[0].text,
+      words: cues[0].words,
+      isManual: true,
+    };
+
+    try {
+      setIsAligning(true);
+      setAlignmentError(null);
+      setErrorMessage(null);
+      setActiveModalAnchor(anchorToUse);
+      setIsProgressModalOpen(true);
+      setProgressStep(1);
+      setProgressText(`Preparing audio with Line 1 anchor fixed at [${anchorToUse.startTime.toFixed(2)}s → ${anchorToUse.endTime.toFixed(2)}s]...`);
+      setProgressPercent(15);
+
+      const prep = await prepareAudioForAi(audioInfo.blob, (status, pct) => {
+        setProgressText(status);
+        setProgressPercent(pct);
+        if (pct >= 35) setProgressStep(2);
+      });
+
+      setLastAnalysis(prep.analysis);
+      setProgressStep(3);
+      setProgressText(`AI analyzing audio after ${anchorToUse.endTime.toFixed(2)}s for lines 2–${parsedLines.length}...`);
+      setProgressPercent(70);
+
+      const response = await fetch("/api/align-lyrics", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          audioBase64: prep.base64,
+          mimeType: prep.mimeType,
+          lyricsText,
+          lines: parsedLines,
+          mode: syncMode,
+          audioDuration: audioInfo.duration,
+          analysis: prep.analysis,
+          firstLineAnchor: anchorToUse,
+        }),
+      });
+
+      setProgressStep(4);
+      setProgressText("Enforcing Line 1 lock & sequencing remaining cues...");
+      setProgressPercent(95);
+
+      const data = await response.json();
+
+      if (!response.ok || !data.success) {
+        throw new Error(data.error || "Failed to align remaining lyrics with Line 1 guide.");
+      }
+
+      setCues(data.items);
+      setInitialAlignmentDone(true);
+      setFirstLineManuallySet(true);
+      setFirstLineAnchor(anchorToUse);
+      setProgressPercent(100);
+
+      setTimeout(() => {
+        setIsProgressModalOpen(false);
+        setSuccessToast(`Successfully re-aligned lines 2–${data.items.length} guided by Line 1 [${anchorToUse.startTime.toFixed(2)}s - ${anchorToUse.endTime.toFixed(2)}s]!`);
+        setTimeout(() => setSuccessToast(null), 4500);
+      }, 500);
+    } catch (err: any) {
+      console.error("Auto align with anchor error:", err);
+      setAlignmentError(err.message || "An error occurred during guided AI alignment.");
+    } finally {
+      setIsAligning(false);
+    }
+  };
+
+  // Lock or toggle Line 1 Anchor manually
+  const handleToggleLockLine1Anchor = () => {
+    if (cues.length === 0) return;
+    const line1 = cues[0];
+    const newAnchor: FirstLineAnchor = {
+      startTime: line1.startTime,
+      endTime: line1.endTime,
+      text: line1.text,
+      words: line1.words,
+      isManual: true,
+    };
+    setFirstLineManuallySet(true);
+    setFirstLineAnchor(newAnchor);
+    setSuccessToast(`Locked Line 1 as Anchor Guide (${line1.startTime.toFixed(2)}s - ${line1.endTime.toFixed(2)}s)`);
+    setTimeout(() => setSuccessToast(null), 3000);
   };
 
   // Update specific cue in table
@@ -316,6 +435,17 @@ export default function App() {
       const next = [...prev];
       if (next[index]) {
         next[index] = { ...next[index], ...updated };
+        // If line 1 was updated by user, mark it as manual anchor
+        if (index === 0) {
+          setFirstLineManuallySet(true);
+          setFirstLineAnchor({
+            startTime: next[0].startTime,
+            endTime: next[0].endTime,
+            text: next[0].text,
+            words: next[0].words,
+            isManual: true,
+          });
+        }
       }
       return next;
     });
@@ -331,8 +461,9 @@ export default function App() {
 
   // Set cue in/out point to current playhead
   const handleSetCueToCurrentTime = (index: number, type: 'start' | 'end') => {
+    const newTime = +currentTime.toFixed(3);
     handleUpdateCue(index, {
-      [type === 'start' ? 'startTime' : 'endTime']: +currentTime.toFixed(3),
+      [type === 'start' ? 'startTime' : 'endTime']: newTime,
     });
   };
 
@@ -405,12 +536,53 @@ export default function App() {
     setTimeout(() => setSuccessToast(null), 2500);
   };
 
+  // Programmatic Forced Alignment for Word Boundaries
+  const handleForcedAlignWords = async () => {
+    if (!audioInfo?.blob) {
+      setErrorMessage("Please upload an audio file or load the demo track first.");
+      return;
+    }
+    if (cues.length === 0) {
+      setErrorMessage("Please align lines first before forced-aligning words.");
+      return;
+    }
+
+    try {
+      setSuccessToast("Calculating acoustic waveform forced alignment...");
+      const prep = await prepareAudioForAi(audioInfo.blob);
+      const res = await fetch("/api/forced-align-words", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          audioBase64: prep.base64,
+          linesWithTiming: cues,
+        }),
+      });
+
+      const data = await res.json();
+      if (res.ok && data.success && Array.isArray(data.items)) {
+        setCues(data.items);
+        setSuccessToast(`Acoustically force-aligned words across ${data.items.length} cues!`);
+        setTimeout(() => setSuccessToast(null), 3000);
+      } else {
+        throw new Error(data.error || "Forced alignment failed");
+      }
+    } catch (err: any) {
+      console.error("Forced alignment error:", err);
+      setErrorMessage("Forced alignment error: " + err.message);
+    }
+  };
+
   // Reset workspace
   const handleReset = () => {
     setCues([]);
     setAudioInfo(null);
     setCurrentTime(0);
     setIsPlaying(false);
+    setInitialAlignmentDone(false);
+    setFirstLineManuallySet(false);
+    setFirstLineAnchor(null);
+    setActiveModalAnchor(null);
     setLyricsText(SAMPLE_LYRICS_PRESETS[0].text);
     if (audioRef.current) {
       audioRef.current.pause();
@@ -515,6 +687,10 @@ export default function App() {
               audioLoaded={!!audioInfo}
               cleanEmptyLines={cleanEmptyLines}
               onToggleCleanEmptyLines={() => setCleanEmptyLines(!cleanEmptyLines)}
+              initialAlignmentDone={initialAlignmentDone}
+              firstLineManuallySet={firstLineManuallySet}
+              firstLineAnchor={firstLineAnchor}
+              onAutoAlignWithAnchor={handleAutoAlignWithAnchor}
             />
 
             {/* Quick How It Works card */}
@@ -581,12 +757,19 @@ export default function App() {
               activeCueIndex={activeCueIndex}
               syncMode={syncMode}
               currentTime={currentTime}
+              initialAlignmentDone={initialAlignmentDone}
+              firstLineManuallySet={firstLineManuallySet}
+              firstLineAnchor={firstLineAnchor}
+              isAligning={isAligning}
               onUpdateCue={handleUpdateCue}
               onPlayCue={handlePlayCue}
               onSetCueToCurrentTime={handleSetCueToCurrentTime}
               onShiftAllTimestamps={handleShiftAllTimestamps}
               onSnapToAcousticPeaks={handleSnapToAcousticPeaks}
               onRemoveOverlaps={handleRemoveOverlaps}
+              onForcedAlignWords={handleForcedAlignWords}
+              onAutoAlignWithAnchor={handleAutoAlignWithAnchor}
+              onToggleLockLine1Anchor={handleToggleLockLine1Anchor}
             />
 
           </div>
@@ -604,6 +787,7 @@ export default function App() {
         lineCount={lineCount}
         audioDuration={audioInfo?.duration || 0}
         error={alignmentError}
+        anchorInfo={activeModalAnchor}
         onClose={() => setIsProgressModalOpen(false)}
         onUseFallbackVocalSync={handleInstantVocalSync}
       />

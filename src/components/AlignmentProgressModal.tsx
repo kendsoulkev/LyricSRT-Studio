@@ -1,5 +1,6 @@
 import React from 'react';
-import { Sparkles, CheckCircle2, Loader2, Music, Waves, Cpu, AlertCircle } from 'lucide-react';
+import { Sparkles, CheckCircle2, Loader2, AlertCircle, Anchor } from 'lucide-react';
+import { FirstLineAnchor } from '../types';
 
 interface AlignmentProgressModalProps {
   isOpen: boolean;
@@ -9,6 +10,7 @@ interface AlignmentProgressModalProps {
   lineCount: number;
   audioDuration: number;
   error?: string | null;
+  anchorInfo?: FirstLineAnchor | null;
   onClose?: () => void;
   onUseFallbackVocalSync?: () => void;
 }
@@ -21,6 +23,7 @@ export const AlignmentProgressModal: React.FC<AlignmentProgressModalProps> = ({
   lineCount,
   audioDuration,
   error,
+  anchorInfo,
   onClose,
   onUseFallbackVocalSync,
 }) => {
@@ -29,7 +32,13 @@ export const AlignmentProgressModal: React.FC<AlignmentProgressModalProps> = ({
   const steps = [
     { num: 1, title: 'WAV Audio Decoding', desc: `Processing track (~${audioDuration.toFixed(1)}s)` },
     { num: 2, title: 'Vocal Activity Detection', desc: 'Analyzing voice energy & phrases' },
-    { num: 3, title: 'AI Transcript Synchronization', desc: `Aligning ${lineCount} verbatim lyric lines` },
+    {
+      num: 3,
+      title: anchorInfo ? 'Guided AI Synchronization' : 'AI Transcript Synchronization',
+      desc: anchorInfo
+        ? `Aligning lines 2–${lineCount} strictly after ${anchorInfo.endTime.toFixed(2)}s`
+        : `Aligning ${lineCount} verbatim lyric lines`,
+    },
     { num: 4, title: 'Cue Timing Verification', desc: 'Validating line count & boundary timestamps' },
   ];
 
@@ -42,22 +51,39 @@ export const AlignmentProgressModal: React.FC<AlignmentProgressModalProps> = ({
 
         {/* Header */}
         <div className="flex items-center gap-3">
-          <div className="w-10 h-10 rounded-2xl bg-cyan-500/10 border border-cyan-500/30 flex items-center justify-center text-cyan-400">
+          <div className="w-10 h-10 rounded-2xl bg-cyan-500/10 border border-cyan-500/30 flex items-center justify-center text-cyan-400 shrink-0">
             {error ? (
               <AlertCircle className="w-5 h-5 text-rose-400" />
+            ) : anchorInfo ? (
+              <Anchor className="w-5 h-5 text-amber-400 animate-pulse" />
             ) : (
               <Sparkles className="w-5 h-5 animate-pulse" />
             )}
           </div>
           <div>
             <h3 className="text-base font-bold text-white">
-              {error ? 'Synchronization Status' : 'AI Audio Synchronization'}
+              {error ? 'Synchronization Status' : anchorInfo ? 'Guided AI Audio Alignment' : 'AI Audio Synchronization'}
             </h3>
             <p className="text-xs text-zinc-400">
-              Matching {lineCount} lyric lines to WAV audio timing
+              {anchorInfo
+                ? `Aligning lines 2–${lineCount} using Line 1 anchor guide`
+                : `Matching ${lineCount} lyric lines to WAV audio timing`}
             </p>
           </div>
         </div>
+
+        {/* Anchor Info Banner */}
+        {anchorInfo && !error && (
+          <div className="p-2.5 rounded-xl bg-amber-950/40 border border-amber-800/60 text-xs flex items-center justify-between gap-2 text-amber-200">
+            <div className="flex items-center gap-1.5 min-w-0">
+              <Anchor className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+              <span className="font-medium truncate">Line 1 Locked:</span>
+            </div>
+            <span className="font-mono font-bold text-[11px] text-amber-300 shrink-0">
+              {anchorInfo.startTime.toFixed(2)}s → {anchorInfo.endTime.toFixed(2)}s
+            </span>
+          </div>
+        )}
 
         {/* Progress Bar */}
         {!error && (
