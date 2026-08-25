@@ -466,30 +466,28 @@ export function snapAiWordsToLocalVad(
 }
 
 /**
- * Post-processing guard to smooth out rapid text clipping.
+ * High-Precision Subtitle Continuous Flow Sequencer
+ * Removes timing gaps between words to eliminate lingering text and irregular jumps.
  */
 export function applyLinguisticSmoothing(cues: any[]): any[] {
+  if (cues.length <= 1) return cues;
+
   for (let i = 0; i < cues.length - 1; i++) {
     const current = cues[i];
     const next = cues[i + 1];
 
-    // Lock sequential words together seamlessly to prevent early flickering
-    if (current.endTime > next.startTime) {
-      current.endTime = next.startTime;
-      if (current.words && current.words[0]) {
-        current.words[0].endTime = next.startTime;
-      }
-    }
+    const currentWord = current.words?.[0] || current;
+    const nextWord = next.words?.[0] || next;
 
-    // Force an automatic minimum viewing duration of 180ms for human readability
-    const duration = current.endTime - current.startTime;
-    if (duration < 0.180) {
-      current.endTime = +(current.startTime + 0.180).toFixed(3);
-      if (current.words && current.words[0]) {
-        current.words[0].endTime = current.endTime;
-      }
-    }
+    // Enforce strict sequential continuity: 
+    // The previous word ends the exact millisecond the next word begins
+    currentWord.endTime = nextWord.startTime;
+
+    // Re-map variables back to parent subtitle layer containers
+    current.startTime = currentWord.startTime;
+    current.endTime = currentWord.endTime;
   }
+
   return cues;
 }
 
