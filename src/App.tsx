@@ -10,7 +10,7 @@ import { TapSyncModal } from './components/TapSyncModal';
 import { AlignmentProgressModal } from './components/AlignmentProgressModal';
 import { AudioTrackInfo, SubtitleCue, SyncMode, FirstLineAnchor } from './types';
 import { SAMPLE_LYRICS_PRESETS } from './data/sampleLyrics';
-import { prepareAudioForAi, extractWaveformPeaks, generateDemoSong, alignLyricsToVocalSegments, AudioAnalysisResult, sliceAudioBufferExact, sliceAudioBufferWithSilence, sliceAudioBufferToBase64, decodeAudioBlobToBuffer } from './utils/audio';
+import { prepareAudioForAi, extractWaveformPeaks, generateDemoSong, alignLyricsToVocalSegments, AudioAnalysisResult, sliceAudioBufferExact, sliceAudioBufferWithSilence, sliceAudioBufferToBase64, decodeAudioBlobToBuffer, refineWordTimestampsWithVocalOnsets, ENABLE_WORD_ONSET_REFINEMENT } from './utils/audio';
 import { generateAccurateWordCuesFromLines, formatGeminiResponseToCues, distributeTimePhoneticallyWithDecay, snapAiWordsToLocalVad, applyLinguisticSmoothing } from './utils/srt';
 import { fetchPreciseWordAlignment } from './utils/gemini';
 import { AlertCircle, CheckCircle2, Music2, Sparkles, HelpCircle } from 'lucide-react';
@@ -428,10 +428,15 @@ export default function App() {
         }
 
         setProgressStep(4);
-        setProgressText("Finalizing zero-drift subtitle cues...");
+        setProgressText("Finalizing zero-drift subtitle cues & acoustic onsets...");
         setProgressPercent(100);
 
-        const optimizedTimeline = applyLinguisticSmoothing(finalPrecisionWordCues);
+        // Apply conservative late-word onset refinement (only shifts earlier if strong acoustic evidence exists)
+        const refinedWordCues = ENABLE_WORD_ONSET_REFINEMENT
+          ? refineWordTimestampsWithVocalOnsets(finalPrecisionWordCues, decodedBuffer, prep.analysis.vocalSegments)
+          : finalPrecisionWordCues;
+
+        const optimizedTimeline = applyLinguisticSmoothing(refinedWordCues);
         setCues(optimizedTimeline);
         setInitialAlignmentDone(true);
         setFirstLineManuallySet(false);
@@ -583,7 +588,13 @@ export default function App() {
 
       let finalItems = data.items;
       if (syncMode === 'word') {
-        finalItems = generateAccurateWordCuesFromLines(data.items, prep.analysis.vocalSegments);
+        const wordCues = generateAccurateWordCuesFromLines(data.items, prep.analysis.vocalSegments);
+        if (ENABLE_WORD_ONSET_REFINEMENT) {
+          const decodedBuf = await decodeAudioBlobToBuffer(audioInfo.blob);
+          finalItems = refineWordTimestampsWithVocalOnsets(wordCues, decodedBuf, prep.analysis.vocalSegments);
+        } else {
+          finalItems = wordCues;
+        }
       }
 
       setCues(finalItems);

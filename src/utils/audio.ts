@@ -1,3 +1,5 @@
+import { SubtitleCue } from '../types';
+
 /**
  * Audio analysis, waveform rendering, and vocal activity detection (VAD) algorithms.
  */
@@ -643,3 +645,190 @@ export async function generateDemoSong(lyricsLines: string[]): Promise<{ blob: B
     duration: totalDuration,
   };
 }
+
+export const ENABLE_WORD_ONSET_REFINEMENT = true;
+export const MAX_EARLIER_CORRECTION_SEC = 0.120; // 120ms maximum earlier correction limit
+export const MIN_CONFIDENCE_THRESHOLD = 0.65;    // High-confidence threshold
+
+/**
+ * Conservative Late-Word Onset Refinement
+ * 
+ * Inspects a small acoustic window [startTime - 120ms, startTime - 15ms] before the baseline
+ * word timestamp. Uses 300Hz-3400Hz vocal formant bandpass filtering to isolate singing
+ * voice attacks and reject drum/percussion hits.
+ * 
+ * Only adjusts a timestamp earlier if strong vocal acoustic evidence exists.
+ * Preserves baseline timestamp when confidence is low or evidence is ambiguous.
+ */
+export function refineWordTimestampsWithVocalOnsets(
+  cues: SubtitleCue[],
+  audioBuffer: AudioBuffer | null,
+  vocalSegments: VocalSegment[] = []
+): SubtitleCue[] {
+  if (!ENABLE_WORD_ONSET_REFINEMENT || !cues || cues.length === 0 || !audioBuffer) {
+    return cues;
+  }
+
+  const sampleRate = audioBuffer.sampleRate;
+  const rawChannelData = audioBuffer.getChannelData(0);
+
+  // Bandpass filter 300Hz to 3400Hz to isolate human vocal formants and eliminate kick drums & cymbal crashes
+  const b0 = 0.2929, b1 = 0, b2 = -0.2929, a1 = -0.9428, a2 = 0.4142;
+  const filteredData = new Float32Array(rawChannelData.length);
+  let x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+  for (let i = 0; i < rawChannelData.length; i++) {
+    const x0 = rawChannelData[i];
+    const y0 = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+    filteredData[i] = y0;
+    x2 = x1; x1 = x0; y2 = y1; y1 = y0;
+  }
+
+  const refinedCues: SubtitleCue[] = cues.map(c => ({
+    ...c,
+    words: c.words ? c.words.map(w => ({ ...w })) : undefined
+  }));
+
+  for (let i = 0; i < refinedCues.length; i++) {
+    const current = refinedCues[i];
+    const prev = i > 0 ? refinedCues[i - 1] : null;
+    const wordText = current.text || (current.words && current.words[0]?.word) || `Word ${i + 1}`;
+    const origStart = current.startTime;
+
+    // Search window: [origStart - 120ms, origStart - 15ms]
+    const windowStartSec = Math.max(0, origStart - MAX_EARLIER_CORRECTION_SEC);
+    const windowEndSec = Math.max(0, origStart - 0.015);
+
+    if (windowEndSec <= windowStartSec) {
+      console.log(
+        `[WordTiming]\nWord: "${wordText}"\nOriginal start: ${origStart.toFixed(3)}\nDetected onset: none\nCorrection: 0.000\nConfidence: 0.00\nApplied: NO\nReason: search window too small`
+      );
+      continue;
+    }
+
+    // Extract micro-frames: 10ms frame with 2.5ms hop
+    const frameSize = Math.floor(sampleRate * 0.010);
+    const hopSize = Math.floor(sampleRate * 0.0025);
+
+    // Look at an analysis region starting 80ms before windowStartSec up to 80ms after origStart
+    const analysisRegionStart = Math.max(0, windowStartSec - 0.080);
+    const analysisRegionEnd = Math.min(audioBuffer.duration, origStart + 0.080);
+
+    const startSample = Math.floor(analysisRegionStart * sampleRate);
+    const endSample = Math.floor(analysisRegionEnd * sampleRate);
+    const regionLength = endSample - startSample;
+
+    if (regionLength < frameSize * 3) {
+      console.log(
+        `[WordTiming]\nWord: "${wordText}"\nOriginal start: ${origStart.toFixed(3)}\nDetected onset: none\nCorrection: 0.000\nConfidence: 0.00\nApplied: NO\nReason: insufficient audio samples in region`
+      );
+      continue;
+    }
+
+    const numFrames = Math.floor((regionLength - frameSize) / hopSize);
+    const frameEnergies: number[] = new Array(numFrames);
+    const frameZcr: number[] = new Array(numFrames);
+    const frameTimes: number[] = new Array(numFrames);
+
+    for (let f = 0; f < numFrames; f++) {
+      const offset = startSample + f * hopSize;
+      let sumSq = 0;
+      let crossings = 0;
+      for (let s = 0; s < frameSize; s++) {
+        const sIdx = offset + s;
+        const val = filteredData[sIdx] || 0;
+        const nextVal = filteredData[sIdx + 1] || 0;
+        sumSq += val * val;
+        if ((val > 0 && nextVal < 0) || (val < 0 && nextVal > 0)) {
+          crossings++;
+        }
+      }
+      frameEnergies[f] = Math.sqrt(sumSq / frameSize);
+      frameZcr[f] = crossings / frameSize;
+      frameTimes[f] = (offset + frameSize / 2) / sampleRate;
+    }
+
+    // Baseline background energy before windowStart
+    const preWindowFrames = frameEnergies.filter((_, idx) => frameTimes[idx] < windowStartSec);
+    const baselineEnergy = preWindowFrames.length > 0
+      ? preWindowFrames.reduce((a, b) => a + b, 0) / preWindowFrames.length
+      : 0.001;
+
+    // Search for sharpest valid vocal onset candidate in [windowStartSec, windowEndSec]
+    let bestCandidateTime: number | null = null;
+    let bestConfidence = 0;
+
+    for (let f = 1; f < numFrames - 2; f++) {
+      const t = frameTimes[f];
+      if (t < windowStartSec || t > windowEndSec) continue;
+
+      const ePre = (frameEnergies[f - 1] + frameEnergies[Math.max(0, f - 2)]) / 2;
+      const eCur = frameEnergies[f];
+      const ePost = (frameEnergies[f + 1] + frameEnergies[Math.min(numFrames - 1, f + 2)]) / 2;
+      const zcr = frameZcr[f];
+
+      // Energy rise ratio
+      const energyGain = eCur - ePre;
+      const relativeRise = ePre > 0 ? (eCur - ePre) / ePre : (eCur > 0.01 ? 2.0 : 0);
+
+      // Check for vocal sustain in post-onset window (ensures not a fleeting percussive click)
+      const isSustained = ePost >= eCur * 0.70 || ePost > baselineEnergy * 1.8;
+
+      // Consonant friction or formant onset
+      const isAcousticOnset = (energyGain > 0.005 && relativeRise > 0.65 && isSustained) ||
+                              (zcr > 0.20 && eCur > baselineEnergy * 1.2 && isSustained);
+
+      if (isAcousticOnset) {
+        // Compute confidence metric based on sharpness, sustain, and VAD alignment
+        const contrastScore = Math.min(1.0, (ePost - baselineEnergy) / (Math.max(0.01, ePost) + 1e-4));
+        const slopeScore = Math.min(1.0, relativeRise / 2.5);
+        const nearVadSegment = vocalSegments.some(s => Math.abs(s.startTime - t) <= 0.070);
+        const vadBonus = nearVadSegment ? 0.20 : 0.0;
+
+        const confidence = +(Math.max(0, Math.min(1.0, 0.45 * contrastScore + 0.35 * slopeScore + vadBonus))).toFixed(2);
+
+        if (confidence > bestConfidence) {
+          bestConfidence = confidence;
+          bestCandidateTime = t;
+        }
+      }
+    }
+
+    if (bestCandidateTime !== null && bestConfidence >= MIN_CONFIDENCE_THRESHOLD) {
+      const proposedStart = +bestCandidateTime.toFixed(3);
+      const correction = +(proposedStart - origStart).toFixed(3);
+
+      // Verify monotonicity with previous word
+      const minAllowableStart = prev ? +(prev.startTime + 0.040).toFixed(3) : 0;
+
+      if (proposedStart < minAllowableStart) {
+        console.log(
+          `[WordTiming]\nWord: "${wordText}"\nOriginal start: ${origStart.toFixed(3)}\nDetected onset: ${proposedStart.toFixed(3)}\nCorrection: ${correction.toFixed(3)}\nConfidence: ${bestConfidence.toFixed(2)}\nApplied: NO\nReason: conflicts with previous word boundary`
+        );
+      } else {
+        // Apply conservative earlier onset
+        current.startTime = proposedStart;
+        if (current.words && current.words[0]) {
+          current.words[0].startTime = proposedStart;
+        }
+        // If previous cue overlapped, clamp its end time safely
+        if (prev && prev.endTime > proposedStart) {
+          prev.endTime = proposedStart;
+          if (prev.words && prev.words[0]) {
+            prev.words[0].endTime = proposedStart;
+          }
+        }
+
+        console.log(
+          `[WordTiming]\nWord: "${wordText}"\nOriginal start: ${origStart.toFixed(3)}\nDetected onset: ${proposedStart.toFixed(3)}\nCorrection: ${correction.toFixed(3)}\nConfidence: ${bestConfidence.toFixed(2)}\nApplied: YES`
+        );
+      }
+    } else {
+      console.log(
+        `[WordTiming]\nWord: "${wordText}"\nOriginal start: ${origStart.toFixed(3)}\nDetected onset: ${bestCandidateTime !== null ? bestCandidateTime.toFixed(3) : 'none'}\nCorrection: ${bestCandidateTime !== null ? (bestCandidateTime - origStart).toFixed(3) : '0.000'}\nConfidence: ${bestConfidence.toFixed(2)}\nApplied: NO\nReason: ${bestCandidateTime !== null ? 'confidence too low' : 'no clear vocal attack transient'}`
+      );
+    }
+  }
+
+  return refinedCues;
+}
+
