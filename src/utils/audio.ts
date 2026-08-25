@@ -73,48 +73,80 @@ export async function prepareAudioForAi(
 }
 
 /**
- * High-accuracy Voice Activity & Vocal Onset Analyzer
- * Detects phrases, pauses, energy spikes, and singing bursts
+ * Advanced Spectral VAD Analyzer
+ * Filters out sub-bass and high cymbals, then tracks vocal formants and consonant onsets.
  */
-export function analyzeVocalActivity(buffer: AudioBuffer): AudioAnalysisResult {
-  const channelData = buffer.getChannelData(0);
+export function analyzeVocalActivityAdvanced(buffer: AudioBuffer): VocalSegment[] {
   const sampleRate = buffer.sampleRate;
-  const duration = buffer.duration;
+  const rawData = buffer.getChannelData(0);
 
-  // Analysis window: 50ms frames with 25ms overlap
-  const frameSize = Math.floor(sampleRate * 0.05); // 50ms
-  const hopSize = Math.floor(sampleRate * 0.025);   // 25ms
-  const numFrames = Math.floor((channelData.length - frameSize) / hopSize);
+  // 1. Setup analysis windows (25ms frames, 10ms hop for ultra-high resolution)
+  const frameSize = Math.floor(sampleRate * 0.025); 
+  const hopSize = Math.floor(sampleRate * 0.010); 
+  const numFrames = Math.floor((rawData.length - frameSize) / hopSize);
+
+  // 2. Simple Software Bandpass Filter (300Hz to 3400Hz) to isolate human voice
+  // Low-pass and High-pass coefficients approximation for human speech formants
+  const filteredData = new Float32Array(rawData.length);
+  let x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+  // Standard Butterworth bandpass coefficients for human voice formants
+  const b0 = 0.2929, b1 = 0, b2 = -0.2929, a1 = -0.9428, a2 = 0.4142;
+
+  for (let i = 0; i < rawData.length; i++) {
+    const x0 = rawData[i];
+    const y0 = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+    filteredData[i] = y0;
+    x2 = x1; x1 = x0; y2 = y1; y1 = y0;
+  }
 
   const energies: number[] = new Array(numFrames);
+  const zcrRates: number[] = new Array(numFrames);
   let totalEnergy = 0;
 
+  // 3. Compute Frame Energy (RMS) and Zero-Crossing Rate (ZCR)
   for (let f = 0; f < numFrames; f++) {
     const offset = f * hopSize;
     let sumSquares = 0;
+    let zeroCrossings = 0;
+
     for (let i = 0; i < frameSize; i++) {
-      const val = channelData[offset + i];
-      sumSquares += val * val;
+      const idx = offset + i;
+      const currentSample = filteredData[idx];
+      const nextSample = filteredData[idx + 1] || 0;
+
+      sumSquares += currentSample * currentSample;
+
+      // Track Zero Crossings for tracking sharp consonant starts (fricatives)
+      if ((currentSample > 0 && nextSample < 0) || (currentSample < 0 && nextSample > 0)) {
+        zeroCrossings++;
+      }
     }
+
     const rms = Math.sqrt(sumSquares / frameSize);
     energies[f] = rms;
+    zcrRates[f] = zeroCrossings / frameSize;
     totalEnergy += rms;
   }
 
   const avgEnergy = totalEnergy / Math.max(1, numFrames);
   const maxEnergy = Math.max(...energies, 0.001);
-  const threshold = Math.max(avgEnergy * 0.45, maxEnergy * 0.08);
+  // Adaptive thresholding: Ignores heavy bass beats and background instrument floor noise
+  const energyThreshold = Math.max(avgEnergy * 0.50, maxEnergy * 0.09);
 
-  // Group continuous active frames into vocal segments
   const segments: VocalSegment[] = [];
   let inSegment = false;
   let segStartFrame = 0;
-  let maxFrameEnergy = 0;
   let peakFrame = 0;
+  let maxFrameEnergy = 0;
 
   for (let f = 0; f < numFrames; f++) {
     const e = energies[f];
-    if (e >= threshold) {
+    const z = zcrRates[f];
+
+    // High ZCR values indicate a consonant start even if the musical volume is briefly lower
+    const isVocalActivity = e >= energyThreshold || (e > energyThreshold * 0.5 && z > 0.18);
+
+    if (isVocalActivity) {
       if (!inSegment) {
         inSegment = true;
         segStartFrame = f;
@@ -126,13 +158,13 @@ export function analyzeVocalActivity(buffer: AudioBuffer): AudioAnalysisResult {
       }
     } else {
       if (inSegment) {
-        // Minimum segment duration 0.3s
         const segDuration = ((f - segStartFrame) * hopSize) / sampleRate;
-        if (segDuration >= 0.25) {
+        // Require a 180ms minimum duration to validate a human vocal syllable block
+        if (segDuration >= 0.18) {
           segments.push({
-            startTime: +( (segStartFrame * hopSize) / sampleRate ).toFixed(3),
-            endTime: +( (f * hopSize) / sampleRate ).toFixed(3),
-            peakTime: +( (peakFrame * hopSize) / sampleRate ).toFixed(3),
+            startTime: +((segStartFrame * hopSize) / sampleRate).toFixed(3),
+            endTime: +((f * hopSize) / sampleRate).toFixed(3),
+            peakTime: +((peakFrame * hopSize) / sampleRate).toFixed(3),
             energy: +(maxFrameEnergy / maxEnergy).toFixed(3),
           });
         }
@@ -141,17 +173,30 @@ export function analyzeVocalActivity(buffer: AudioBuffer): AudioAnalysisResult {
     }
   }
 
-  // If last segment still open
   if (inSegment) {
-    segments.push({
-      startTime: +( (segStartFrame * hopSize) / sampleRate ).toFixed(3),
-      endTime: +duration.toFixed(3),
-      peakTime: +( (peakFrame * hopSize) / sampleRate ).toFixed(3),
-      energy: +(maxFrameEnergy / maxEnergy).toFixed(3),
-    });
+    const segDuration = ((numFrames - segStartFrame) * hopSize) / sampleRate;
+    if (segDuration >= 0.18) {
+      segments.push({
+        startTime: +((segStartFrame * hopSize) / sampleRate).toFixed(3),
+        endTime: +buffer.duration.toFixed(3),
+        peakTime: +((peakFrame * hopSize) / sampleRate).toFixed(3),
+        energy: +(maxFrameEnergy / maxEnergy).toFixed(3),
+      });
+    }
   }
 
-  const firstSignificantSegment = segments.find(s => s.energy >= 0.15 && (s.endTime - s.startTime) >= 0.28) || segments[0];
+  return segments;
+}
+
+/**
+ * High-accuracy Voice Activity & Vocal Onset Analyzer
+ * Detects phrases, pauses, energy spikes, and singing bursts using formant & ZCR filtering
+ */
+export function analyzeVocalActivity(buffer: AudioBuffer): AudioAnalysisResult {
+  const duration = buffer.duration;
+  const segments = analyzeVocalActivityAdvanced(buffer);
+
+  const firstSignificantSegment = segments.find(s => (s.energy ?? 0) >= 0.15 && (s.endTime - s.startTime) >= 0.25) || segments[0];
   const firstVocalOnset = firstSignificantSegment ? firstSignificantSegment.startTime : 1.5;
   const lastVocalOffset = segments.length > 0 ? segments[segments.length - 1].endTime : Math.max(2, duration - 1.5);
   
@@ -312,6 +357,143 @@ export function audioBufferToWavBlob(buffer: AudioBuffer): Blob {
   }
 
   return new Blob([outBuffer], { type: 'audio/wav' });
+}
+
+/**
+ * Slices an exact sub-segment from an AudioBuffer without artificial silence padding
+ * to provide pure acoustic frames for local forced alignment.
+ */
+export async function sliceAudioBufferExact(
+  parentBuffer: AudioBuffer,
+  startTime: number,
+  endTime: number
+): Promise<{ base64: string; duration: number }> {
+  const sampleRate = parentBuffer.sampleRate;
+  const safeStart = Math.max(0, startTime);
+  const safeEnd = Math.min(parentBuffer.duration, Math.max(safeStart + 0.05, endTime));
+  const startSample = Math.floor(safeStart * sampleRate);
+  const endSample = Math.ceil(safeEnd * sampleRate);
+  const frameLength = Math.max(1, endSample - startSample);
+
+  const offlineCtx = new OfflineAudioContext(
+    parentBuffer.numberOfChannels,
+    frameLength,
+    sampleRate
+  );
+
+  const source = offlineCtx.createBufferSource();
+  source.buffer = parentBuffer;
+  source.connect(offlineCtx.destination);
+  source.start(0, safeStart, (endSample - startSample) / sampleRate);
+
+  const renderedChunk = await offlineCtx.startRendering();
+  const wavBlob = audioBufferToWavBlob(renderedChunk);
+  const base64 = await blobToBase64(wavBlob);
+
+  return {
+    base64,
+    duration: frameLength / sampleRate,
+  };
+}
+
+/**
+ * Upgraded Micro-Slicer with Leading Silence Calibration Injection.
+ * Eliminates the AI initialization lag penalty.
+ */
+export async function sliceAudioBufferWithSilence(
+  parentBuffer: AudioBuffer,
+  startTime: number,
+  endTime: number
+): Promise<{ base64: string; silenceInjected: number }> {
+  const sampleRate = parentBuffer.sampleRate;
+  const SILENCE_PAD = 0.500; // 500ms of structural silence
+
+  const voiceDuration = Math.max(0.05, endTime - startTime);
+  const totalDuration = SILENCE_PAD + voiceDuration;
+  const totalSamples = Math.ceil(totalDuration * sampleRate);
+
+  const offlineCtx = new OfflineAudioContext(
+    parentBuffer.numberOfChannels,
+    totalSamples,
+    sampleRate
+  );
+
+  // Render the vocal performance starting EXACTLY after the silence block
+  const source = offlineCtx.createBufferSource();
+  source.buffer = parentBuffer;
+  source.connect(offlineCtx.destination);
+  
+  // Start playing the voice exactly at the 500ms mark of the new chunk
+  source.start(SILENCE_PAD, Math.max(0, startTime), voiceDuration);
+
+  const renderedChunk = await offlineCtx.startRendering();
+  const wavBlob = audioBufferToWavBlob(renderedChunk);
+  const base64 = await blobToBase64(wavBlob);
+
+  return {
+    base64,
+    silenceInjected: SILENCE_PAD
+  };
+}
+
+/**
+ * Slicer with Lookahead Padding to eliminate audio onset clipping lag.
+ * Extracts an exact sub-segment from an AudioBuffer with a 250ms lookahead handle and converts it to Base64 WAV.
+ */
+export async function sliceAudioBufferToBase64(
+  parentBuffer: AudioBuffer,
+  startTime: number,
+  endTime: number
+): Promise<{ base64: string; actualStartPadding: number }> {
+  const sampleRate = parentBuffer.sampleRate;
+  
+  // Create a 250ms safety pad BEFORE the line starts
+  const PADDING = 0.250;
+  const safeStartTime = Math.max(0, startTime);
+  const adjustedStart = Math.max(0, safeStartTime - PADDING);
+  const actualStartPadding = safeStartTime - adjustedStart; // Track exact padding used
+
+  const safeEndTime = Math.min(parentBuffer.duration, Math.max(safeStartTime + 0.05, endTime));
+  const startSample = Math.floor(adjustedStart * sampleRate);
+  const endSample = Math.ceil(safeEndTime * sampleRate);
+  const frameLength = Math.max(1, endSample - startSample);
+
+  // Create an offline rendering context for the short duration chunk
+  const offlineCtx = new OfflineAudioContext(
+    parentBuffer.numberOfChannels,
+    frameLength,
+    sampleRate
+  );
+
+  // Render the specific snippet slice
+  const source = offlineCtx.createBufferSource();
+  source.buffer = parentBuffer;
+
+  // Connect with offset to position the window at absolute 0.0 in the new clip
+  source.connect(offlineCtx.destination);
+  source.start(0, adjustedStart, (endSample - startSample) / sampleRate);
+
+  const renderedChunk = await offlineCtx.startRendering();
+  const wavBlob = audioBufferToWavBlob(renderedChunk);
+  const base64 = await blobToBase64(wavBlob);
+
+  return {
+    base64,
+    actualStartPadding,
+  };
+}
+
+/**
+ * Decodes a Blob or File into an AudioBuffer using the browser Web Audio API.
+ */
+export async function decodeAudioBlobToBuffer(blob: Blob): Promise<AudioBuffer> {
+  const arrayBuffer = await blob.arrayBuffer();
+  const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+  try {
+    return await audioCtx.decodeAudioData(arrayBuffer.slice(0));
+  } finally {
+    audioCtx.close();
+  }
 }
 
 function writeString(view: DataView, offset: number, string: string) {

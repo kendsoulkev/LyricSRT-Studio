@@ -181,7 +181,7 @@ export const SrtPreviewExport: React.FC<SrtPreviewExportProps> = ({
               {syncMode === 'word' && activeCue.words && activeCue.words.length > 0 ? (
                 <div className="text-xl sm:text-2xl font-bold flex flex-wrap items-center justify-center gap-x-2 gap-y-1">
                   {activeCue.words.map((w, wIdx) => {
-                    const isWordActive = currentTime >= w.startTime && currentTime <= w.endTime;
+                    const isWordActive = currentTime >= (w.startTime - 0.035) && currentTime <= w.endTime;
                     const isWordPast = currentTime > w.endTime;
                     return (
                       <span

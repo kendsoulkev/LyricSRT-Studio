@@ -10,6 +10,19 @@ export interface WordTiming {
   selectedSource?: 'ai' | 'acoustic' | 'arbitrated';
 }
 
+export interface GeminiWord {
+  word: string;
+  startTime: number;
+  endTime: number;
+}
+
+export interface VocalSegment {
+  startTime: number;
+  endTime: number;
+  peakTime?: number;
+  energy?: number;
+}
+
 export interface FirstLineAnchor {
   startTime: number;
   endTime: number;

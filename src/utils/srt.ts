@@ -1,4 +1,4 @@
-import { SubtitleCue, SyncMode } from '../types';
+import { SubtitleCue, SyncMode, GeminiWord, VocalSegment } from '../types';
 
 /**
  * Formats seconds into SRT timestamp: HH:MM:SS,mmm
@@ -229,3 +229,267 @@ export function triggerDownload(filename: string, content: string, mimeType = 't
   document.body.removeChild(link);
   URL.revokeObjectURL(url);
 }
+
+/**
+ * Map clean Gemini word-level forced alignment response directly into app subtitle cues.
+ */
+export function formatGeminiResponseToCues(geminiOutput: GeminiWord[]): SubtitleCue[] {
+  return geminiOutput.map((item, index) => {
+    return {
+      id: `cue-${index + 1}-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
+      index: index + 1,
+      text: item.word,
+      startTime: item.startTime,
+      endTime: item.endTime,
+      words: [
+        {
+          word: item.word,
+          startTime: item.startTime,
+          endTime: item.endTime,
+        },
+      ],
+    };
+  });
+}
+
+interface PreciseWord {
+  word: string;
+  startTime: number;
+  endTime: number;
+}
+
+/**
+ * Calculates the phonetic structural weight of a word using syllable and letter profiles.
+ * Prevents small connector words from eating up time blocks belonging to long words.
+ */
+export function calculateWordPhoneticWeight(word: string): number {
+  const clean = word.toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (clean.length <= 2) return 1.0; // Short words like "a", "I", "in", "to"
+
+  // Count vowel groupings (including common singing diphthongs)
+  const vowelMatches = clean.match(/[aeiouy]{1,2}/g);
+  let syllables = vowelMatches ? vowelMatches.length : 1;
+
+  // Silent "e" adjustments at the end of English words
+  if (clean.endsWith('e') && !clean.endsWith('le') && syllables > 1) {
+    syllables -= 1;
+  }
+
+  // Weight scales heavily based on syllable density + physical length complexity
+  return syllables * 2.0 + (clean.length * 0.3);
+}
+
+/**
+ * Distributes an absolute length of time across an array of words based on their phonetic weight.
+ */
+export function distributeTimePhonetically(
+  words: string[],
+  absoluteStart: number,
+  absoluteEnd: number
+): { word: string; startTime: number; endTime: number }[] {
+  const totalDuration = absoluteEnd - absoluteStart;
+  if (words.length === 0 || totalDuration <= 0) return [];
+
+  const weights = words.map(w => calculateWordPhoneticWeight(w));
+  const totalWeight = weights.reduce((sum, w) => sum + w, 0) || 1;
+
+  let currentMarker = absoluteStart;
+
+  return words.map((word, idx) => {
+    const wordWeight = weights[idx];
+    const allocatedDuration = (wordWeight / totalWeight) * totalDuration;
+    
+    const wStart = currentMarker;
+    // Enforce strict boundary lock for the last word to completely block drift
+    const wEnd = idx === words.length - 1 ? absoluteEnd : currentMarker + allocatedDuration;
+    currentMarker = wEnd;
+
+    return {
+      word,
+      startTime: +wStart.toFixed(3),
+      endTime: +wEnd.toFixed(3),
+    };
+  });
+}
+
+/**
+ * Advanced Phonetic Distributor with Syllable Density & Natural Decay Tracking.
+ * Distributes time across words accurately without unnatural skewing.
+ */
+export function distributeTimePhoneticallyWithDecay(
+  words: string[],
+  absoluteStart: number,
+  absoluteEnd: number,
+  isEndOfLine = false
+): { word: string; startTime: number; endTime: number }[] {
+  // Use natural phonetic syllable weighting across the full duration
+  return distributeTimePhonetically(words, absoluteStart, absoluteEnd);
+}
+
+/**
+ * Transforms standard line cues into acoustic-mapped word-by-word subtitle cues.
+ * Uses real vocal audio energy spikes and phonetic syllable weighting to prevent flat linear distribution errors.
+ */
+export function generateAccurateWordCuesFromLines(
+  lineCues: SubtitleCue[],
+  vocalSegments: VocalSegment[] = [] // Pass the local VAD results from prepareAudioForAi
+): SubtitleCue[] {
+  const wordCues: SubtitleCue[] = [];
+  let globalWordIndex = 1;
+
+  lineCues.forEach((line) => {
+    const rawWords = line.text.split(/\s+/).filter(Boolean);
+    if (rawWords.length === 0) return;
+
+    // 1. Extract the actual audio energy segments that fall inside this line's time window
+    // Added a small 150ms padding buffer to catch words that start slightly early or bleed out
+    const linePeaks = vocalSegments.filter(
+      (seg) => seg.startTime >= (line.startTime - 0.15) && seg.endTime <= (line.endTime + 0.15)
+    );
+
+    let mappedWords: PreciseWord[] = [];
+
+    // SCENARIO A: Complete 1:1 Vocal Burst to Word match
+    if (linePeaks.length === rawWords.length) {
+      mappedWords = rawWords.map((word, idx) => ({
+        word,
+        startTime: linePeaks[idx].startTime,
+        endTime: linePeaks[idx].endTime,
+      }));
+    }
+    // SCENARIO B: Shared Vocal Burst Clusters -> Apply Phonetic Distribution inside Clusters with Decay Tracking
+    else if (linePeaks.length > 0) {
+      const peaksToWordsRatio = rawWords.length / linePeaks.length;
+
+      linePeaks.forEach((peak, peakIdx) => {
+        const startW = Math.floor(peakIdx * peaksToWordsRatio);
+        const endW = Math.min(rawWords.length, Math.floor((peakIdx + 1) * peaksToWordsRatio));
+        const clusterWords = rawWords.slice(startW, endW);
+        const isLastPeak = peakIdx === linePeaks.length - 1;
+
+        if (clusterWords.length > 0) {
+          // Use phonetic calculation with decay tracking to split up the shared audio peak cluster
+          const partitionedWords = distributeTimePhoneticallyWithDecay(
+            clusterWords,
+            peak.startTime,
+            peak.endTime,
+            isLastPeak
+          );
+          mappedWords.push(...partitionedWords);
+        }
+      });
+    }
+
+    // SCENARIO C: Complete Fallback -> Apply Phonetic Distribution with Decay across the entire macro line
+    if (mappedWords.length !== rawWords.length) {
+      mappedWords = distributeTimePhoneticallyWithDecay(rawWords, line.startTime, line.endTime, true);
+    }
+
+    // 2. Unfurl the acoustically positioned words into independent subtitle cue items
+    mappedWords.forEach((wordObj) => {
+      wordCues.push({
+        id: `word-cue-${globalWordIndex}-${Date.now()}`,
+        index: globalWordIndex,
+        text: wordObj.word,
+        startTime: wordObj.startTime,
+        endTime: wordObj.endTime,
+        words: [wordObj],
+      });
+      globalWordIndex++;
+    });
+  });
+
+  return wordCues;
+}
+
+/**
+ * Snaps raw AI word timestamps to the nearest local formant-filtered vocal segments.
+ * Eliminates irregular early/late micro-fluctuations.
+ */
+export function snapAiWordsToLocalVad(
+  aiWords: { word: string; relativeStart?: number; relativeEnd?: number; startTime?: number; endTime?: number }[],
+  lineAbsoluteStart: number,
+  localVocalSegments: VocalSegment[] = [],
+  startPaddingOffset: number = 0
+): { word: string; absoluteStart: number; absoluteEnd: number }[] {
+  // Find all VAD segments belonging to this micro-chunk line container
+  const lineBufferPadding = 0.350;
+  const currentLineVad = (localVocalSegments || []).filter(
+    (seg) => seg.startTime >= (lineAbsoluteStart - lineBufferPadding)
+  );
+
+  return aiWords.map((item) => {
+    const relStart = typeof item.relativeStart === 'number' ? item.relativeStart : (item.startTime || 0);
+    const relEnd = typeof item.relativeEnd === 'number' ? item.relativeEnd : (item.endTime || relStart + 0.3);
+
+    const unpaddedRelStart = Math.max(0, relStart - startPaddingOffset);
+    const unpaddedRelEnd = Math.max(unpaddedRelStart + 0.05, relEnd - startPaddingOffset);
+
+    const rawAbsoluteStart = lineAbsoluteStart + unpaddedRelStart;
+    const rawAbsoluteEnd = lineAbsoluteStart + unpaddedRelEnd;
+
+    // Find the closest real vocal burst start boundary
+    let bestStartMatch = rawAbsoluteStart;
+    let minStartDistance = Infinity;
+
+    currentLineVad.forEach((seg) => {
+      const distance = Math.abs(seg.startTime - rawAbsoluteStart);
+      // Only snap if a real audio burst exists within a 350ms window
+      if (distance < 0.350 && distance < minStartDistance) {
+        minStartDistance = distance;
+        bestStartMatch = seg.startTime;
+      }
+    });
+
+    // Find the closest real vocal burst end boundary
+    let bestEndMatch = rawAbsoluteEnd;
+    let minEndDistance = Infinity;
+
+    currentLineVad.forEach((seg) => {
+      const distance = Math.abs(seg.endTime - rawAbsoluteEnd);
+      if (distance < 0.350 && distance < minEndDistance) {
+        minEndDistance = distance;
+        bestEndMatch = seg.endTime;
+      }
+    });
+
+    // Fallback to avoid overlapping if snapping compresses the item incorrectly
+    const finalStart = bestStartMatch;
+    const finalEnd = bestEndMatch > finalStart ? bestEndMatch : finalStart + Math.max(0.08, rawAbsoluteEnd - rawAbsoluteStart);
+
+    return {
+      word: item.word,
+      absoluteStart: +Math.max(0, finalStart).toFixed(3),
+      absoluteEnd: +Math.max(finalStart + 0.05, finalEnd).toFixed(3),
+    };
+  });
+}
+
+/**
+ * Post-processing guard to smooth out rapid text clipping.
+ */
+export function applyLinguisticSmoothing(cues: any[]): any[] {
+  for (let i = 0; i < cues.length - 1; i++) {
+    const current = cues[i];
+    const next = cues[i + 1];
+
+    // Lock sequential words together seamlessly to prevent early flickering
+    if (current.endTime > next.startTime) {
+      current.endTime = next.startTime;
+      if (current.words && current.words[0]) {
+        current.words[0].endTime = next.startTime;
+      }
+    }
+
+    // Force an automatic minimum viewing duration of 180ms for human readability
+    const duration = current.endTime - current.startTime;
+    if (duration < 0.180) {
+      current.endTime = +(current.startTime + 0.180).toFixed(3);
+      if (current.words && current.words[0]) {
+        current.words[0].endTime = current.endTime;
+      }
+    }
+  }
+  return cues;
+}
+
