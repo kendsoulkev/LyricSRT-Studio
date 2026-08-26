@@ -608,7 +608,11 @@ export async function generateDemoSong(lyricsLines: string[]): Promise<{ blob: B
 
 export const ENABLE_WORD_ONSET_REFINEMENT = true;
 export const MAX_EARLIER_CORRECTION_SEC = 0.120; // 120ms maximum earlier correction limit
-export const MIN_CONFIDENCE_THRESHOLD = 0.65;    // High-confidence threshold
+export const MIN_CONFIDENCE_THRESHOLD = 0.65;    // Restored to conservative default. Lowering this
+                                                  // to 0.55 let the refiner treat humming/ad-libs as
+                                                  // valid word attacks (they share the same vocal
+                                                  // formant signature as sung words), pulling word
+                                                  // starts back into non-lyric intro sections.
 
 /**
  * Conservative Late-Word Onset Refinement
@@ -623,7 +627,13 @@ export const MIN_CONFIDENCE_THRESHOLD = 0.65;    // High-confidence threshold
 export function refineWordTimestampsWithVocalOnsets(
   cues: SubtitleCue[],
   audioBuffer: AudioBuffer | null,
-  vocalSegments: VocalSegment[] = []
+  vocalSegments: VocalSegment[] = [],
+  minStartFloors: number[] = [] // Optional: per-cue floor (e.g. that word's source line's
+                                 // confirmed startTime). A correction is never allowed to move
+                                 // a word earlier than its floor, even if strong acoustic
+                                 // "attack" evidence exists there - this is what stops humming,
+                                 // breaths, or intro instrumentation right before a line starts
+                                 // from being mistaken for that line's first word.
 ): SubtitleCue[] {
   if (!ENABLE_WORD_ONSET_REFINEMENT || !cues || cues.length === 0 || !audioBuffer) {
     return cues;
@@ -711,12 +721,17 @@ export function refineWordTimestampsWithVocalOnsets(
       const proposedStart = +bestCandidateTime.toFixed(3);
       const correction = +(proposedStart - origStart).toFixed(3);
 
-      // Verify monotonicity with previous word
-      const minAllowableStart = prev ? +(prev.startTime + 0.040).toFixed(3) : 0;
+      // Verify monotonicity with previous word, AND never cross this word's own floor
+      // (typically its line's already-confirmed start) - see minStartFloors above.
+      const floor = minStartFloors[i] ?? 0;
+      const minAllowableStart = Math.max(
+        prev ? +(prev.startTime + 0.040).toFixed(3) : 0,
+        floor
+      );
 
       if (proposedStart < minAllowableStart) {
         console.log(
-          `[WordTiming]\nWord: "${wordText}"\nOriginal start: ${origStart.toFixed(3)}\nDetected onset: ${proposedStart.toFixed(3)}\nCorrection: ${correction.toFixed(3)}\nConfidence: ${bestConfidence.toFixed(2)}\nApplied: NO\nReason: conflicts with previous word boundary`
+          `[WordTiming]\nWord: "${wordText}"\nOriginal start: ${origStart.toFixed(3)}\nDetected onset: ${proposedStart.toFixed(3)}\nCorrection: ${correction.toFixed(3)}\nConfidence: ${bestConfidence.toFixed(2)}\nApplied: NO\nReason: conflicts with previous word boundary or line floor`
         );
       } else {
         // Apply conservative earlier onset
@@ -798,4 +813,68 @@ export function audioBufferToWavBlob(buffer: AudioBuffer): Blob {
   }
 
   return new Blob([view], { type: 'audio/wav' });
+}
+
+/**
+ * Advanced Acoustic Peak-Attack Discriminator
+ * Distinguishes flat verbal humming from true articulated word onsets using Spectral Flux approximations.
+ */
+export function detectTrueSpeechOnset(
+  audioBuffer: AudioBuffer,
+  vocalSegments: VocalSegment[]
+): number {
+  if (!vocalSegments || vocalSegments.length === 0) return 0;
+
+  const sampleRate = audioBuffer.sampleRate;
+  const channelData = audioBuffer.getChannelData(0);
+
+  // Setup tight 10ms analytical evaluation windows
+  const frameSize = Math.floor(sampleRate * 0.010);
+
+  let firstTrueOnset = vocalSegments[0].startTime;
+
+  // We analyze only the early portion of the song (first 25 seconds) where intro humming occurs
+  const searchCeilingSeconds = Math.min(25, audioBuffer.duration);
+  const searchCeilingSamples = Math.floor(searchCeilingSeconds * sampleRate);
+
+  let prevRms = 0;
+  let maxFluxFound = 0;
+  let clearSpeechFrame = 0;
+
+  for (let offset = 0; offset < searchCeilingSamples - frameSize; offset += frameSize) {
+    let sumSquares = 0;
+    for (let i = 0; i < frameSize; i++) {
+      const sample = channelData[offset + i];
+      sumSquares += sample * sample;
+    }
+    const rms = Math.sqrt(sumSquares / frameSize);
+
+    // Spectral Flux approximation: tracks the rate of absolute acoustic change.
+    // Humming has high volume (RMS) but very flat, constant flux. 
+    // Spoken words create a violent, steep spike in flux during articulation.
+    const acousticFlux = Math.abs(rms - prevRms);
+    prevRms = rms;
+
+    const currentTimestamp = offset / sampleRate;
+
+    // Check if this frame sits inside a recognized voice activity window
+    const isInsideVocalSegment = vocalSegments.some(
+      seg => currentTimestamp >= seg.startTime && currentTimestamp <= seg.endTime
+    );
+
+    if (isInsideVocalSegment && acousticFlux > maxFluxFound) {
+      // Require a minimum flux threshold to ensure it's a real word attack, not a smooth hum
+      if (acousticFlux > 0.015) {
+        maxFluxFound = acousticFlux;
+        clearSpeechFrame = offset;
+      }
+    }
+  }
+
+  if (clearSpeechFrame > 0) {
+    firstTrueOnset = clearSpeechFrame / sampleRate;
+    console.log(`[Discriminator] Isolated true spoken onset at ${firstTrueOnset.toFixed(3)}s. Filtered out early humming profiles.`);
+  }
+
+  return firstTrueOnset;
 }

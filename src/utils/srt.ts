@@ -491,3 +491,87 @@ export function applyLinguisticSmoothing(cues: any[]): any[] {
   return cues;
 }
 
+/**
+ * Advanced Intro Silence Mask Guard
+ * Inspects local audio energy envelopes to prevent text from lighting up during early humming or instrumentals.
+ */
+export function maskIntroHummingSegments(
+  compiledCues: SubtitleCue[],
+  vocalSegments: VocalSegment[] = []
+): SubtitleCue[] {
+  if (!compiledCues || compiledCues.length === 0 || !vocalSegments || vocalSegments.length === 0) {
+    return compiledCues;
+  }
+
+  // 1. Identify the first true high-energy spoken onset burst in the track
+  // Filters out low-amplitude hums or background noise floors
+  const activeSpeechOnsets = vocalSegments.filter((seg) => typeof seg.energy === 'number' ? seg.energy > 0.25 : true);
+  if (activeSpeechOnsets.length === 0) return compiledCues;
+
+  const absoluteFirstWordOnset = activeSpeechOnsets[0].startTime;
+
+  // 2. Scan and calibrate cues falling within the initial track intro window
+  return compiledCues.map((cue) => {
+    const wordObj = cue.words?.[0] || { startTime: cue.startTime, endTime: cue.endTime, word: cue.text };
+
+    // If the timing engine positioned a word early during an instrumental or humming block,
+    // force it to wait until the physical voice activity detection tracks actual speech.
+    if (wordObj.startTime < absoluteFirstWordOnset) {
+      console.log(`[HummingMask] Shifted word "${wordObj.word}" forward from ${wordObj.startTime}s to match real onset at ${absoluteFirstWordOnset}s.`);
+
+      const adjustedStart = absoluteFirstWordOnset;
+      const originalDuration = wordObj.endTime - wordObj.startTime;
+      const adjustedEnd = adjustedStart + Math.max(0.200, originalDuration);
+
+      return {
+        ...cue,
+        startTime: +adjustedStart.toFixed(3),
+        endTime: +adjustedEnd.toFixed(3),
+        words: [{
+          word: wordObj.word,
+          startTime: +adjustedStart.toFixed(3),
+          endTime: +adjustedEnd.toFixed(3)
+        }]
+      };
+    }
+
+    return cue;
+  });
+}
+
+/**
+ * Clean Intro Structural Gate
+ * Shields the intro window from premature text triggers by mapping early items to the first spoken onset.
+ */
+export function applyIntroSpeechGate(
+  cues: SubtitleCue[],
+  trueSpeechOnset: number
+): SubtitleCue[] {
+  if (!cues || cues.length === 0 || trueSpeechOnset <= 0) return cues;
+
+  return cues.map((cue) => {
+    const wordObj = cue.words?.[0] || { startTime: cue.startTime, endTime: cue.endTime, word: cue.text };
+
+    // If the synchronization engine positioned a word early inside the humming or intro block,
+    // hold its display back until the playhead crosses the true spoken attack boundary.
+    if (wordObj.startTime < trueSpeechOnset) {
+      const originalDuration = wordObj.endTime - wordObj.startTime;
+      const adjustedStart = trueSpeechOnset;
+      const adjustedEnd = adjustedStart + Math.max(0.180, originalDuration);
+
+      return {
+        ...cue,
+        startTime: +adjustedStart.toFixed(3),
+        endTime: +adjustedEnd.toFixed(3),
+        words: [{
+          word: wordObj.word,
+          startTime: +adjustedStart.toFixed(3),
+          endTime: +adjustedEnd.toFixed(3)
+        }]
+      };
+    }
+
+    return cue;
+  });
+}
+

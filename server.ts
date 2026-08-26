@@ -22,14 +22,7 @@ function getGeminiClient(): GoogleGenAI {
   if (!apiKey) {
     throw new Error("GEMINI_API_KEY environment variable is not configured.");
   }
-  return new GoogleGenAI({
-    apiKey,
-    httpOptions: {
-      headers: {
-        "User-Agent": "aistudio-build",
-      },
-    },
-  });
+  return new GoogleGenAI({ apiKey });
 }
 
 // Health check endpoint
@@ -78,10 +71,12 @@ app.post("/api/precise-word-alignment", async (req, res) => {
       return res.status(400).json({ error: "Missing audioBase64 or referenceLyrics." });
     }
 
+    const cleanAudioBase64 = String(audioBase64).replace(/^data:[^;]+;base64,/, "").replace(/\s/g, "");
+
     if (mode === 'micro-chunk') {
       try {
         // Convert incoming base64 back into a raw node binary buffer
-        const audioBuffer = Buffer.from(audioBase64, 'base64');
+        const audioBuffer = Buffer.from(cleanAudioBase64, 'base64');
 
         // Execute local mathematical forced-alignment on the raw audio signal bytes
         const precisionTimings = await alignAudioWordsLocally(audioBuffer, referenceLyrics);
@@ -184,7 +179,6 @@ CRITICAL RULES FOR ACCURACY:
 
     const candidateModels = Array.from(new Set([
       modelName,
-      "gemini-3.6-flash",
       "gemini-3.7-flash",
       "gemini-flash-latest",
       "gemini-3.1-flash-lite",
@@ -212,7 +206,7 @@ CRITICAL RULES FOR ACCURACY:
                   {
                     inlineData: {
                       mimeType: "audio/wav",
-                      data: audioBase64,
+                      data: cleanAudioBase64,
                     },
                   },
                   {
@@ -339,13 +333,14 @@ CRITICAL RULES FOR ACCURACY:
   }
 });
 
-// Align lyrics to audio endpoint
+// Align lyrics to audio endpoint - Fast Single-Pass Global Macro Route
 app.post("/api/align-lyrics", async (req, res) => {
   try {
     const {
       audioBase64,
       mimeType = "audio/wav",
       lyricsText,
+      lyricsLines,
       lines,
       mode = "line",
       audioDuration,
@@ -354,367 +349,162 @@ app.post("/api/align-lyrics", async (req, res) => {
     } = req.body;
 
     if (!audioBase64) {
-      return res.status(400).json({ error: "Missing audio data." });
+      return res.status(400).json({ error: "Missing required audioBase64." });
     }
 
-    if (!lyricsText && (!lines || lines.length === 0)) {
-      return res.status(400).json({ error: "Missing lyric text or lines." });
-    }
+    const cleanAudioBase64 = String(audioBase64).replace(/^data:[^;]+;base64,/, "").replace(/\s/g, "");
 
-    // Check if a human-verified Line 1 Anchor was provided as a synchronization guide
-    const hasAnchor = Boolean(
-      firstLineAnchor &&
-      typeof firstLineAnchor.startTime === "number" &&
-      typeof firstLineAnchor.endTime === "number" &&
-      firstLineAnchor.endTime > firstLineAnchor.startTime
-    );
-
-    // Decode PCM audio for high-resolution acoustic transient and forced-alignment tracking
-    const pcmData = decodeWavBase64(audioBase64);
-
-    // Prepare line list
-    const inputLines: string[] = Array.isArray(lines) && lines.length > 0
+    // Prepare clean line list from any supported format
+    const inputLines: string[] = Array.isArray(lyricsLines) && lyricsLines.length > 0
+      ? lyricsLines
+      : Array.isArray(lines) && lines.length > 0
       ? lines
-      : lyricsText
-          .split("\n")
-          .map((l: string) => l.trim())
-          .filter((l: string) => l.length > 0);
+      : typeof lyricsText === "string"
+        ? lyricsText.split("\n").map((l: string) => l.trim()).filter(Boolean)
+        : [];
 
     if (inputLines.length === 0) {
-      return res.status(400).json({ error: "No valid lyric lines provided." });
+      return res.status(400).json({ error: "Missing lyric text or lines array." });
     }
 
-    const isWordMode = mode === "word";
-    const approxDuration = typeof audioDuration === "number" && audioDuration > 0 ? audioDuration : (pcmData?.duration || 180);
+    console.log(`🎬 Initiating fast single-pass global macro alignment for ${inputLines.length} lines...`);
+
+    const pcmData = decodeWavBase64(cleanAudioBase64);
+    const approxDuration = typeof audioDuration === "number" && audioDuration > 0
+      ? audioDuration
+      : (pcmData?.duration || 180);
     const vocalSegments = Array.isArray(analysis?.vocalSegments) ? analysis.vocalSegments : [];
-    
-    // Detect physical vocal onset from PCM audio waveform
-    const detectedPcmOnset = detectGlobalVocalOnset(pcmData);
-    const firstOnsetSec = hasAnchor
-      ? Math.max(0, firstLineAnchor.startTime)
-      : Math.max(
-          0.3,
-          analysis?.firstVocalOnset && analysis.firstVocalOnset > 0.4
-            ? Math.min(analysis.firstVocalOnset, detectedPcmOnset)
-            : detectedPcmOnset
-        );
-    const lastOffsetSec = analysis?.lastVocalOffset || Math.max(2, approxDuration - 1.0);
-    const firstOnset = `${firstOnsetSec.toFixed(2)}s`;
-    const lastOffset = `${lastOffsetSec.toFixed(2)}s`;
 
-    let alignedItems: any[] = [];
-    let alignmentSource: "gemini_ai" | "google_speech_v2" | "forced_alignment" | "vocal_energy" = "gemini_ai";
-    let warningNote: string | undefined;
-
-    // 1. Try Google Cloud Speech-to-Text V2 with word timestamps and lyric vocabulary biasing
-    let speechAlignedItems = null;
-    try {
-      const speechWords = await recognizeAudioWithWordTimestamps(
-        audioBase64,
-        pcmData?.sampleRate || 16000,
-        inputLines
-      );
-      if (speechWords && speechWords.length > 0) {
-        console.log(`Google Cloud Speech-to-Text returned ${speechWords.length} timestamped words.`);
-        speechAlignedItems = alignSpeechWordsToLyrics(speechWords, inputLines);
-        if (speechAlignedItems) {
-          console.log("Successfully aligned Speech-to-Text words to lyric lines via sequence alignment.");
-        }
+    const lineResponseSchema = {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          lineIndex: { type: Type.NUMBER, description: "1-based line index" },
+          text: { type: Type.STRING, description: "Verbatim lyric line text" },
+          startTime: { type: Type.NUMBER, description: "Absolute start time in seconds (float)" },
+          endTime: { type: Type.NUMBER, description: "Absolute end time in seconds (float)" }
+        },
+        required: ["lineIndex", "text", "startTime", "endTime"]
       }
-    } catch (e) {
-      // Speech client not configured, continue to Multimodal AI + Acoustic Formant Aligner
-    }
+    };
 
-    // 2. Multimodal AI Forced Alignment
-    try {
-      const ai = getGeminiClient();
+    const systemInstruction = `You are a professional audio-to-text macro alignment system.
+Map the provided list of verbatim lyric lines to their true start and end timestamps.
+Do not guess timestamps during instrumental intros, guitar solos, or non-verbal humming tracks. 
+If a line begins after an instrumental intro, its startTime must reflect the exact millisecond the first actual word is articulated.
+Return strictly chronological, non-overlapping timestamps for all ${inputLines.length} lines.`;
 
-      const systemInstruction = `You are a highly precise audio time-alignment expert and professional lyric-to-audio subtitle synchronizer (SRT/LRC specialist).
-Your sole mission is to take the provided .wav audio file and the exact, user-provided reference lyrics text, and output a perfectly synchronized word-for-word subtitle dataset.
+    const candidateModels = [
+      "gemini-3.7-flash",
+      "gemini-3.1-flash-lite",
+      "gemini-flash-latest",
+      "gemini-2.5-flash"
+    ];
 
-CRITICAL RULES FOR ACCURACY:
-1. DO NOT guess, hallucinate, or alter any words. Use ONLY the exact words provided in the reference lyrics.
-2. Match the exact phonetic sounds in the audio to the provided lyrics. This is a "Forced Alignment" task.
-3. Every single word must receive its own distinct subtitle timestamp.
-4. Audio timestamps must be accurate to the millisecond in seconds format (e.g. 14.520).
-${hasAnchor ? `
-5. CRITICAL HUMAN ANCHOR & FIXED LINE 1 BOUNDARY:
-- A human audio engineer has manually verified and LOCKED the exact timing of Line 1:
-  Line 1 ("${firstLineAnchor.text || inputLines[0]}"): Start = ${firstLineAnchor.startTime.toFixed(3)}s, End = ${firstLineAnchor.endTime.toFixed(3)}s.
-- CRITICAL BOUNDARY RULE: Line 1's timing is 100% FIXED and locked to ${firstLineAnchor.startTime.toFixed(3)}s - ${firstLineAnchor.endTime.toFixed(3)}s.
-- CRITICAL SEQUENCE CONSTRAINT: ALL SUBSEQUENT LYRIC LINES (Lines 2 through ${inputLines.length}) MUST OCCUR STRICTLY AFTER LINE 1 (start time >= ${firstLineAnchor.endTime.toFixed(3)}s).
-- NEVER place Line 2 or any subsequent line before ${firstLineAnchor.endTime.toFixed(3)}s.
-- Listen to the audio starting from ${firstLineAnchor.endTime.toFixed(3)}s onward to align Lines 2 through ${inputLines.length}.
-` : `
-5. INSTRUMENTAL INTRO & SILENCE: Look for the true vocal onset transient in the audio. In this track, physical vocal activity begins at approximately ~${firstOnset} (NOT at 0.000s if there is an instrumental intro or silence). NEVER place the first timestamp at 0.000s unless the singer is actively speaking/singing at the very first millisecond.
-`}
-6. Account for musical pauses, instrumental breaks, and sustained vocal notes. Do not let timestamps drift. If a word is held for 3 seconds, the timestamp for that word must span the entire 3 seconds.
-7. Return strictly sequential, non-overlapping timestamps for all ${inputLines.length} lines.
-${isWordMode ? "8. WORD-BY-WORD PRECISION: For each line, output the 'words' array with precise start and end times for every single word based on acoustic phoneme attacks." : ""}
-`;
+    let parsedItems: any[] | null = null;
+    let alignmentSource: "gemini_ai" | "vocal_energy" = "gemini_ai";
 
-      const userPrompt = `Here is the audio file (~${approxDuration.toFixed(2)}s duration) and the exact ${inputLines.length} lines of text to synchronize:
-${hasAnchor ? `\n[GUIDE ANCHOR: Line 1 timing is LOCKED by human verification to ${firstLineAnchor.startTime.toFixed(3)}s - ${firstLineAnchor.endTime.toFixed(3)}s. Synchronize all subsequent lines starting strictly after ${firstLineAnchor.endTime.toFixed(3)}s].\n` : ''}
-LYRIC LINES:
-${inputLines.map((line, idx) => `[Line ${idx + 1}] ${line}`).join("\n")}
+    const ai = getGeminiClient();
 
-Please listen carefully to the vocal track, identify when each specific line is vocalized, and return the precise timestamps in the structured JSON format.`;
-
-      const audioPart = {
-        inlineData: {
-          mimeType: mimeType.includes("wav") ? "audio/wav" : mimeType.includes("mp3") || mimeType.includes("mpeg") ? "audio/mp3" : mimeType,
-          data: audioBase64,
-        },
-      };
-
-      const wordSchema = {
-        type: Type.OBJECT,
-        properties: {
-          word: { type: Type.STRING, description: "The word text" },
-          startTime: { type: Type.NUMBER, description: "Start time in seconds" },
-          endTime: { type: Type.NUMBER, description: "End time in seconds" },
-        },
-        required: ["word", "startTime", "endTime"],
-      };
-
-      const itemSchema = {
-        type: Type.OBJECT,
-        properties: {
-          index: { type: Type.INTEGER, description: "1-based line index" },
-          text: { type: Type.STRING, description: "The lyric line verbatim" },
-          startTime: { type: Type.NUMBER, description: "Line start time in seconds (float)" },
-          endTime: { type: Type.NUMBER, description: "Line end time in seconds (float)" },
-          ...(isWordMode
-            ? {
-                words: {
-                  type: Type.ARRAY,
-                  items: wordSchema,
-                  description: "Individual word timestamps for this line",
-                },
-              }
-            : {}),
-        },
-        required: ["index", "text", "startTime", "endTime"],
-      };
-
-      const candidateModels = [
-        "gemini-3.6-flash",
-        "gemini-3.7-flash",
-        "gemini-flash-latest",
-        "gemini-3.1-flash-lite",
-      ];
-      let response: any = null;
-      let lastAiError: any = null;
-
-      for (const modelName of candidateModels) {
+    for (const modelName of candidateModels) {
+      let succeeded = false;
+      for (let attempt = 1; attempt <= 2; attempt++) {
         try {
-          console.log(`Attempting lyric alignment with model: ${modelName}`);
-          response = await ai.models.generateContent({
+          const response = await ai.models.generateContent({
             model: modelName,
             contents: [
               {
-                role: "user",
-                parts: [audioPart, { text: userPrompt }],
+                inlineData: {
+                  mimeType: mimeType.includes("wav") ? "audio/wav" : mimeType.includes("mp3") || mimeType.includes("mpeg") ? "audio/mp3" : mimeType,
+                  data: cleanAudioBase64
+                }
               },
+              {
+                text: `Align these lines verbatim:\n\n${inputLines.map((l, idx) => `[${idx + 1}] ${l}`).join('\n')}`
+              }
             ],
             config: {
               systemInstruction,
+              temperature: 0.0,
               responseMimeType: "application/json",
-              responseSchema: {
-                type: Type.ARRAY,
-                items: itemSchema,
-              },
-              temperature: 0.1,
-              maxOutputTokens: 8192,
-            },
+              responseSchema: lineResponseSchema
+            }
           });
 
           if (response && response.text) {
-            console.log(`Successfully received alignment from model: ${modelName}`);
-            break;
+            const rawData = JSON.parse(response.text.trim());
+            if (Array.isArray(rawData) && rawData.length > 0) {
+              parsedItems = rawData;
+              succeeded = true;
+              break;
+            }
           }
         } catch (modelErr: any) {
           const is503 = modelErr?.status === "UNAVAILABLE" || modelErr?.code === 503 || String(modelErr?.message || "").includes("503");
-          const is429 = modelErr?.status === "RESOURCE_EXHAUSTED" || modelErr?.code === 429 || String(modelErr?.message || "").includes("429");
-          if (is503) {
-            console.log(`Model ${modelName} is temporarily busy (503), switching to next model...`);
-          } else if (is429) {
-            console.log(`Model ${modelName} reached free tier quota limit (429), switching to next model...`);
-          } else {
-            console.log(`Model ${modelName} notice: ${modelErr?.message || modelErr}, switching to next model...`);
+          if (is503 && attempt === 1) {
+            console.log(`[Global Align] Model ${modelName} is temporarily busy (503), retrying with backoff...`);
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+            continue;
           }
-          lastAiError = modelErr;
+          console.log(`[Global Align] Model ${modelName} unavailable, cascading to next model...`);
+          break;
         }
       }
+      if (succeeded) break;
+    }
 
-      if (response && response.text) {
-        const responseText = response.text || "[]";
-        alignedItems = JSON.parse(responseText);
-        alignmentSource = "gemini_ai";
-      } else {
-        console.warn("All Gemini models busy, seamlessly using acoustic vocal forced-alignment engine.");
-        alignmentSource = "vocal_energy";
-        warningNote = "Synchronized via high-precision acoustic vocal onset & transient engine.";
-      }
-    } catch (aiErr: any) {
-      console.warn("Gemini alignment fallback to acoustic forced alignment:", aiErr?.message || aiErr);
+    // Process and normalize output items
+    let finalCues: any[] = [];
+    if (parsedItems && parsedItems.length > 0) {
+      finalCues = inputLines.map((lineText, idx) => {
+        const item = parsedItems?.find((p: any) => p.lineIndex === idx + 1) || parsedItems?.[idx];
+        const s = typeof item?.startTime === "number" ? Math.max(0, item.startTime) : (idx * 3.0);
+        const e = typeof item?.endTime === "number" ? Math.min(approxDuration, Math.max(s + 0.1, item.endTime)) : (s + 2.5);
+        return {
+          id: `cue-${idx + 1}-${Date.now()}-${idx}`,
+          index: idx + 1,
+          lineIndex: idx + 1,
+          text: lineText,
+          startTime: +s.toFixed(3),
+          endTime: +e.toFixed(3),
+        };
+      });
+      alignmentSource = "gemini_ai";
+    } else {
+      console.warn("Gemini global alignment unavailable, using vocal energy acoustic segments.");
+      const step = approxDuration / inputLines.length;
+      finalCues = inputLines.map((lineText, idx) => {
+        const targetTime = idx * step;
+        const nearestSeg = vocalSegments.find((s: any) => Math.abs(s.startTime - targetTime) < step * 0.75);
+        const s = nearestSeg ? nearestSeg.startTime : targetTime;
+        const e = nearestSeg ? Math.min(approxDuration, nearestSeg.endTime + 0.25) : Math.min(approxDuration, s + step * 0.85);
+        return {
+          id: `cue-${idx + 1}-${Date.now()}-${idx}`,
+          index: idx + 1,
+          lineIndex: idx + 1,
+          text: lineText,
+          startTime: +s.toFixed(3),
+          endTime: +Math.max(s + 0.1, e).toFixed(3),
+        };
+      });
       alignmentSource = "vocal_energy";
-      warningNote = "Synchronized via high-precision acoustic vocal onset & transient engine.";
     }
 
-    if (speechAlignedItems && speechAlignedItems.length === inputLines.length) {
-      alignedItems = speechAlignedItems;
-      alignmentSource = "google_speech_v2";
-      console.log("Using Google Speech-to-Text V2 aligned items.");
-    }
-
-    // Post-process with Programmatic Forced Alignment & Acoustic Transient Snapping
-    const remainingCount = Math.max(1, inputLines.length - 1);
-    const anchorEndTime = hasAnchor ? firstLineAnchor.endTime : firstOnsetSec;
-    const remainingSpan = Math.max(1, lastOffsetSec - anchorEndTime);
-    const remainingStep = remainingSpan / remainingCount;
-    const standardSpan = Math.max(1, lastOffsetSec - firstOnsetSec);
-    const standardStep = standardSpan / inputLines.length;
-
-    let previousEnd = hasAnchor ? firstLineAnchor.endTime : 0;
-
-    const finalItems = inputLines.map((originalText, i) => {
-      const match = alignedItems[i] || alignedItems.find((item: any) => item.index === i + 1);
-
-      let rawStart: number;
-      let rawEnd: number;
-
-      // Handle Line 1 with Human Guide Anchor
-      if (i === 0 && hasAnchor) {
-        rawStart = Math.max(0, firstLineAnchor.startTime);
-        rawEnd = Math.max(rawStart + 0.05, firstLineAnchor.endTime);
-      } else if (match && typeof match.startTime === "number" && typeof match.endTime === "number") {
-        rawStart = Math.max(0, match.startTime);
-        rawEnd = Math.min(approxDuration, match.endTime);
-
-        // If anchor exists, enforce that all lines after Line 1 start strictly after anchorEndTime
-        if (hasAnchor && i > 0 && rawStart < anchorEndTime) {
-          rawStart = anchorEndTime + (i * 0.1);
-          if (rawEnd <= rawStart) {
-            rawEnd = Math.min(approxDuration, rawStart + remainingStep * 0.85);
-          }
-        }
-        
-        // Prevent line 0 from starting at 0.0s if an instrumental intro exists (non-anchor case)
-        if (i === 0 && !hasAnchor && rawStart < 0.25 && firstOnsetSec > 0.4) {
-          rawStart = firstOnsetSec;
-          if (rawEnd <= rawStart) {
-            rawEnd = Math.min(approxDuration, rawStart + 2.5);
-          }
-        }
-      } else {
-        // Vocal energy onset mapping fallback
-        if (hasAnchor && i > 0) {
-          const targetTime = anchorEndTime + (i - 1) * remainingStep;
-          const eligibleVocalSegs = vocalSegments.filter((s: any) => s.startTime >= anchorEndTime - 0.05);
-          const nearestSeg = eligibleVocalSegs.find(
-            (s: any) => Math.abs(s.startTime - targetTime) < remainingStep * 0.75
-          );
-          rawStart = nearestSeg ? nearestSeg.startTime : targetTime;
-          rawEnd = nearestSeg ? Math.min(approxDuration, nearestSeg.endTime + 0.25) : Math.min(approxDuration, rawStart + remainingStep * 0.85);
-        } else {
-          const targetTime = firstOnsetSec + i * standardStep;
-          const nearestSeg = vocalSegments.find(
-            (s: any) => Math.abs(s.startTime - targetTime) < standardStep * 0.75
-          );
-          rawStart = nearestSeg ? nearestSeg.startTime : targetTime;
-          rawEnd = nearestSeg ? Math.min(approxDuration, nearestSeg.endTime + 0.25) : Math.min(approxDuration, rawStart + standardStep * 0.85);
-        }
-      }
-
-      // Micro-snap start and end to physical vocal onsets if within 0.35s (only for non-anchored lines)
-      let start = rawStart;
-      let end = rawEnd;
-
-      if (vocalSegments.length > 0 && !(i === 0 && hasAnchor)) {
-        const eligibleStartSegs = hasAnchor && i > 0
-          ? vocalSegments.filter((s: any) => s.startTime >= anchorEndTime)
-          : vocalSegments;
-
-        const closestStartSeg = eligibleStartSegs.find((s: any) => Math.abs(s.startTime - rawStart) < 0.35);
-        if (closestStartSeg) {
-          start = closestStartSeg.startTime;
-        }
-
-        const closestEndSeg = vocalSegments.find((s: any) => Math.abs(s.endTime - rawEnd) < 0.35);
-        if (closestEndSeg && closestEndSeg.endTime > start) {
-          end = closestEndSeg.endTime;
-        }
-      }
-
-      // Guarantee minimum duration and avoid overlap with previous cue if too tight
-      if (i === 0 && hasAnchor) {
-        start = Math.max(0, firstLineAnchor.startTime);
-        end = Math.max(start + 0.05, firstLineAnchor.endTime);
-      } else {
-        if (start < previousEnd && previousEnd > 0) {
-          start = Math.max(start, previousEnd + 0.05);
-        }
-        if (end <= start) {
-          end = Math.min(approxDuration, start + 1.8);
-        }
-      }
-
-      previousEnd = end;
-
-      // DUAL-TIME WAV ACOUSTIC COMPARISON & ARBITRATION PIPELINE:
-      // 1. Candidate A: Multimodal AI / ASR word timing predictions
-      // 2. Candidate B: Acoustic Formant Bandpass & Phonetic Consonant Transient Aligner
-      // 3. Arbitration: Physical WAV PCM Cross-Validation to evaluate which timestamp has the highest acoustic correlation!
-      const lineWords = originalText.split(/\s+/).filter(Boolean);
-      let words: Array<any> | undefined = undefined;
-      let lineAcousticScore: number | undefined = undefined;
-
-      if (isWordMode) {
-        // If line 1 has anchor words already provided by user, use them as Candidate A
-        const existingWords = (i === 0 && hasAnchor && Array.isArray(firstLineAnchor.words) && firstLineAnchor.words.length === lineWords.length)
-          ? firstLineAnchor.words
-          : (match && Array.isArray(match.words) && match.words.length === lineWords.length ? match.words : null);
-
-        const rawAiWords = existingWords
-          ? existingWords.map((w: any, wIdx: number) => ({
-              word: lineWords[wIdx],
-              startTime: typeof w.startTime === "number" ? Math.max(start, w.startTime) : start,
-              endTime: typeof w.endTime === "number" ? Math.min(end, Math.max(w.startTime + 0.05, w.endTime)) : end,
-            }))
-          : null;
-
-        words = arbitrateDualWordTimestamps(lineWords, rawAiWords, start, end, pcmData);
-        if (words && words.length > 0) {
-          const totalScore = words.reduce((acc, w) => acc + (w.acousticScore || 80), 0);
-          lineAcousticScore = Math.round(totalScore / words.length);
-        }
-      }
-
-      return {
-        id: `cue-${i + 1}-${Date.now()}-${i}`,
-        index: i + 1,
-        text: originalText,
-        startTime: +start.toFixed(3),
-        endTime: +end.toFixed(3),
-        words,
-        lineAcousticScore,
-        isAnchored: i === 0 && hasAnchor,
-      };
-    });
-
+    console.log(`✅ Success! Compiled ${finalCues.length} line containers via ${alignmentSource}.`);
     return res.json({
       success: true,
-      items: finalItems,
-      lineCount: finalItems.length,
-      mode,
-      source: alignmentSource,
-      warning: warningNote,
+      items: finalCues,
+      lineCount: finalCues.length,
+      mode: mode || "line",
+      source: alignmentSource
     });
+
   } catch (error: any) {
-    console.error("Error in /api/align-lyrics:", error);
+    console.error("Global alignment error:", error);
     return res.status(500).json({
-      error: error.message || "An error occurred while aligning lyrics with AI.",
+      error: "Failed to compile line containers.",
+      message: error?.message || error
     });
   }
 });

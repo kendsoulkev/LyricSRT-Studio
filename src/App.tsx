@@ -10,8 +10,8 @@ import { TapSyncModal } from './components/TapSyncModal';
 import { AlignmentProgressModal } from './components/AlignmentProgressModal';
 import { AudioTrackInfo, SubtitleCue, SyncMode, FirstLineAnchor } from './types';
 import { SAMPLE_LYRICS_PRESETS } from './data/sampleLyrics';
-import { prepareAudioForAi, extractWaveformPeaks, generateDemoSong, alignLyricsToVocalSegments, AudioAnalysisResult, sliceAudioBufferExact, sliceAudioBufferWithContext, sliceAudioBufferWithSilence, sliceAudioBufferToBase64, decodeAudioBlobToBuffer, refineWordTimestampsWithVocalOnsets, ENABLE_WORD_ONSET_REFINEMENT } from './utils/audio';
-import { generateAccurateWordCuesFromLines, formatGeminiResponseToCues, distributeTimePhoneticallyWithDecay, snapAiWordsToLocalVad, applyLinguisticSmoothing } from './utils/srt';
+import { prepareAudioForAi, extractWaveformPeaks, generateDemoSong, alignLyricsToVocalSegments, AudioAnalysisResult, sliceAudioBufferExact, sliceAudioBufferWithContext, sliceAudioBufferWithSilence, sliceAudioBufferToBase64, decodeAudioBlobToBuffer, refineWordTimestampsWithVocalOnsets, detectTrueSpeechOnset, ENABLE_WORD_ONSET_REFINEMENT } from './utils/audio';
+import { generateAccurateWordCuesFromLines, formatGeminiResponseToCues, distributeTimePhoneticallyWithDecay, snapAiWordsToLocalVad, applyLinguisticSmoothing, maskIntroHummingSegments, applyIntroSpeechGate } from './utils/srt';
 import { fetchPreciseWordAlignment } from './utils/gemini';
 import { AlertCircle, CheckCircle2, Music2, Sparkles, HelpCircle } from 'lucide-react';
 
@@ -65,15 +65,54 @@ export default function App() {
   const lineCount = parsedLines.length;
 
   // Handle Sync Mode switching with acoustic-anchored word splitting
-  const handleSyncModeChange = useCallback((newMode: SyncMode) => {
+  const handleSyncModeChange = useCallback(async (newMode: SyncMode) => {
     setSyncMode(newMode);
     if (newMode === 'word' && cues.length > 0) {
       // Pass both verified line cues and local acoustic VAD segments
       const vocalSegments = lastAnalysis?.vocalSegments || [];
       const preciseAcousticWordCues = generateAccurateWordCuesFromLines(cues, vocalSegments);
+
+      // The VAD-based split above only anchors to whichever frame first crosses the
+      // energy threshold, which is inherently a little late (energy has to ramp up
+      // before it trips the threshold). refineWordTimestampsWithVocalOnsets does a
+      // confidence-scored backtrack against the actual bandpassed vocal waveform to
+      // pull each word's start back to its true acoustic attack. It was already used
+      // by the other sync flows but wasn't wired into this mode-toggle path - that's
+      // why toggling to Word-by-Word skipped the correction.
+      if (ENABLE_WORD_ONSET_REFINEMENT && audioInfo?.blob) {
+        try {
+          const decodedBuffer = await decodeAudioBlobToBuffer(audioInfo.blob);
+
+          // Build a per-word floor from the ALREADY-CONFIRMED line start times. A word can
+          // never legitimately start before the line it belongs to does, so this stops the
+          // refiner from mistaking humming/breaths/instrumental lead-in right before a line
+          // for that line's first word, even if the acoustics look attack-like there.
+          // generateAccurateWordCuesFromLines emits exactly one word cue per raw word, per
+          // line, in order, so this stays index-aligned with preciseAcousticWordCues.
+          const lineStartFloors: number[] = [];
+          cues.forEach((line) => {
+            const rawWordCount = line.text.split(/\s+/).filter(Boolean).length;
+            for (let w = 0; w < rawWordCount; w++) {
+              lineStartFloors.push(line.startTime);
+            }
+          });
+
+          const refinedWordCues = refineWordTimestampsWithVocalOnsets(
+            preciseAcousticWordCues,
+            decodedBuffer,
+            vocalSegments,
+            lineStartFloors
+          );
+          setCues(refinedWordCues);
+          return;
+        } catch (err) {
+          console.error('Word onset refinement failed, falling back to unrefined timings:', err);
+        }
+      }
+
       setCues(preciseAcousticWordCues);
     }
-  }, [cues, lastAnalysis]);
+  }, [cues, lastAnalysis, audioInfo]);
 
   // Identify active cue from currentTime
   const activeCueIndex = useMemo(() => {
@@ -392,30 +431,15 @@ export default function App() {
             }
 
             relativeWords.forEach((item: any, idx: number) => {
-              // 1. COMPENSATE FOR LOOKAHEAD CONCONTEXT PADDING
-              // Pull the timestamps forward by the exact padding offset window used during slicing
-              const PROCESSING_LOOKAHEAD = 0.450; // Adjust this to match your slicer pre-window exactly
+              // REMOVED: - PROCESSING_LOOKAHEAD
+              // Because your browser slicer starts exactly at line.startTime, 
+              // item.relativeStart must be added directly without artificial shifts!
+              const absoluteStart = line.startTime + item.relativeStart;
+              const absoluteEnd = line.startTime + item.relativeEnd;
 
-              const absoluteStart = Math.max(0, line.startTime + item.relativeStart - PROCESSING_LOOKAHEAD);
-              const absoluteEnd = Math.max(0, line.startTime + item.relativeEnd - PROCESSING_LOOKAHEAD);
-
-              // 2. PREVENT TIMELINE INVERSION
-              // Ensure that endTime is always mathematically greater than startTime
-              let validatedEnd = absoluteEnd > absoluteStart ? absoluteEnd : absoluteStart + 0.180;
-
-              // 3. SECURE SEQUENTIAL STEP CONTINUITY
-              // Force the word to close cleanly when the next index block begins processing
+              // Protect sequential progression and bridge gaps fluidly
               const nextItem = relativeWords[idx + 1];
-              if (nextItem) {
-                const nextAbsoluteStart = Math.max(0, line.startTime + nextItem.relativeStart - PROCESSING_LOOKAHEAD);
-                if (validatedEnd > nextAbsoluteStart) {
-                  validatedEnd = nextAbsoluteStart;
-                }
-              } else {
-                if (validatedEnd > line.endTime) {
-                  validatedEnd = line.endTime;
-                }
-              }
+              const validatedEnd = nextItem ? (line.startTime + nextItem.relativeStart) : absoluteEnd;
 
               finalPrecisionWordCues.push({
                 id: `word-cue-${globalWordIndex}-${Date.now()}`,
@@ -464,7 +488,20 @@ export default function App() {
           ? refineWordTimestampsWithVocalOnsets(finalPrecisionWordCues, decodedBuffer, prep.analysis.vocalSegments)
           : finalPrecisionWordCues;
 
-        const optimizedTimeline = applyLinguisticSmoothing(refinedWordCues);
+        // 1. Process continuous flow spacing constraints locally
+        let optimizedTimeline = applyLinguisticSmoothing(refinedWordCues);
+
+        // 2. Identify the absolute spoken consonant onset boundary bypassing the humming noise floor
+        const trueSpeechOnsetMarker = detectTrueSpeechOnset(
+          decodedBuffer, 
+          prep.analysis.vocalSegments
+        );
+
+        // 3. Apply the structural gate pass to protect your intro timeline track
+        optimizedTimeline = applyIntroSpeechGate(optimizedTimeline, trueSpeechOnsetMarker);
+        optimizedTimeline = maskIntroHummingSegments(optimizedTimeline, prep.analysis.vocalSegments);
+
+        // 4. Update your primary UI state container
         setCues(optimizedTimeline);
         setInitialAlignmentDone(true);
         setFirstLineManuallySet(false);
@@ -503,7 +540,10 @@ export default function App() {
           throw new Error(data.error || "Failed to align audio and lyrics.");
         }
 
-        setCues(data.items);
+        // Apply Intro Silence Mask Guard to line mode cues
+        const shieldedLineCues = maskIntroHummingSegments(data.items, prep.analysis.vocalSegments);
+
+        setCues(shieldedLineCues);
         setInitialAlignmentDone(true);
         setFirstLineManuallySet(false);
         setFirstLineAnchor(null);
@@ -617,13 +657,17 @@ export default function App() {
       let finalItems = data.items;
       if (syncMode === 'word') {
         const wordCues = generateAccurateWordCuesFromLines(data.items, prep.analysis.vocalSegments);
+        const decodedBuf = await decodeAudioBlobToBuffer(audioInfo.blob);
         if (ENABLE_WORD_ONSET_REFINEMENT) {
-          const decodedBuf = await decodeAudioBlobToBuffer(audioInfo.blob);
           finalItems = refineWordTimestampsWithVocalOnsets(wordCues, decodedBuf, prep.analysis.vocalSegments);
         } else {
           finalItems = wordCues;
         }
+        const trueSpeechOnsetMarker = detectTrueSpeechOnset(decodedBuf, prep.analysis.vocalSegments);
+        finalItems = applyIntroSpeechGate(finalItems, trueSpeechOnsetMarker);
       }
+
+      finalItems = maskIntroHummingSegments(finalItems, prep.analysis.vocalSegments);
 
       setCues(finalItems);
       setInitialAlignmentDone(true);
