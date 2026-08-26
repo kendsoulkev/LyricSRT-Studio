@@ -387,6 +387,52 @@ export default function App() {
           }));
         }
 
+        // Guard against bad/mismatched line anchors before they're used to slice audio and
+        // drive word alignment. Two safeguards:
+        // 1. Enforce strict monotonic, non-overlapping ordering AND a sane minimum duration
+        //    per line (roughly 0.15s/word floor) - a zero/near-zero duration line anchor is
+        //    exactly what causes every word inside it to collapse onto the same timestamp
+        //    downstream, since there's no time span left to distribute words across.
+        // 2. Flag (console.warn) any line whose duration is a wild outlier vs its neighbors -
+        //    a strong signal the aligner (AI or vocal-segment fallback) grabbed the wrong
+        //    occurrence of a repeated lyric line - so it can be spotted and manually corrected
+        //    in the Subtitle Table Editor rather than silently trusted.
+        if (lineAnchors.length > 0) {
+          for (let li = 0; li < lineAnchors.length; li++) {
+            const curLine = lineAnchors[li];
+            const wordCount = Math.max(1, curLine.text.split(/\s+/).filter(Boolean).length);
+            const minDuration = wordCount * 0.15;
+            const minGap = 0.03;
+
+            if (li > 0) {
+              const prevLine = lineAnchors[li - 1];
+              if (curLine.startTime < prevLine.endTime + minGap) {
+                curLine.startTime = prevLine.endTime + minGap;
+              }
+            }
+
+            if (curLine.endTime - curLine.startTime < minDuration) {
+              curLine.endTime = curLine.startTime + minDuration;
+            }
+          }
+
+          const durations = lineAnchors.map((l) => Math.max(0.05, l.endTime - l.startTime));
+          const sortedDur = [...durations].sort((a, b) => a - b);
+          const medianDur = sortedDur[Math.floor(sortedDur.length / 2)];
+
+          lineAnchors.forEach((l, li) => {
+            const dur = l.endTime - l.startTime;
+            if (medianDur > 0 && (dur > medianDur * 4 || dur < medianDur * 0.25)) {
+              console.warn(
+                `[LineAlignment] Line ${li + 1} ("${l.text}") has an unusual duration ` +
+                `(${dur.toFixed(2)}s vs song median ${medianDur.toFixed(2)}s) - possible mismatch ` +
+                `to the wrong occurrence of a repeated lyric line, or a failed alignment. ` +
+                `Verify/correct it in the table editor.`
+              );
+            }
+          });
+        }
+
         setProgressStep(3);
         setProgressText("Decoding local audio buffer for micro-slicing...");
         setProgressPercent(50);
@@ -428,6 +474,23 @@ export default function App() {
 
             if (!Array.isArray(relativeWords) || relativeWords.length === 0) {
               throw new Error("No relative words returned");
+            }
+
+            // Sanity-check the returned timings before trusting them. When the underlying
+            // aligner (local DSP / Replicate / Gemini) fails silently or returns malformed
+            // data, it can come back as a well-formed array where every word's relativeStart
+            // is stuck at 0 (or otherwise non-increasing) - which collapses every word in the
+            // line onto the exact same on-screen timestamp instead of throwing an error we'd
+            // otherwise catch. Reject that here and fall through to the proportional phonetic
+            // fallback instead of silently displaying broken, overlapping timings.
+            const startsAreDistinct = new Set(relativeWords.map((w: any) => w.relativeStart)).size > 1;
+            const isMonotonic = relativeWords.every((w: any, idx: number) =>
+              idx === 0 || (typeof w.relativeStart === 'number' && w.relativeStart >= relativeWords[idx - 1].relativeStart)
+            );
+            if (relativeWords.length > 1 && (!startsAreDistinct || !isMonotonic)) {
+              throw new Error(
+                `Degenerate word timings returned for line ${i + 1} (non-increasing or identical relativeStart values) - rejecting and using fallback distribution`
+              );
             }
 
             relativeWords.forEach((item: any, idx: number) => {
