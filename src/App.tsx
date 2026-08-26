@@ -10,7 +10,7 @@ import { TapSyncModal } from './components/TapSyncModal';
 import { AlignmentProgressModal } from './components/AlignmentProgressModal';
 import { AudioTrackInfo, SubtitleCue, SyncMode, FirstLineAnchor } from './types';
 import { SAMPLE_LYRICS_PRESETS } from './data/sampleLyrics';
-import { prepareAudioForAi, extractWaveformPeaks, generateDemoSong, alignLyricsToVocalSegments, AudioAnalysisResult, sliceAudioBufferExact, sliceAudioBufferWithSilence, sliceAudioBufferToBase64, decodeAudioBlobToBuffer, refineWordTimestampsWithVocalOnsets, ENABLE_WORD_ONSET_REFINEMENT } from './utils/audio';
+import { prepareAudioForAi, extractWaveformPeaks, generateDemoSong, alignLyricsToVocalSegments, AudioAnalysisResult, sliceAudioBufferExact, sliceAudioBufferWithContext, sliceAudioBufferWithSilence, sliceAudioBufferToBase64, decodeAudioBlobToBuffer, refineWordTimestampsWithVocalOnsets, ENABLE_WORD_ONSET_REFINEMENT } from './utils/audio';
 import { generateAccurateWordCuesFromLines, formatGeminiResponseToCues, distributeTimePhoneticallyWithDecay, snapAiWordsToLocalVad, applyLinguisticSmoothing } from './utils/srt';
 import { fetchPreciseWordAlignment } from './utils/gemini';
 import { AlertCircle, CheckCircle2, Music2, Sparkles, HelpCircle } from 'lucide-react';
@@ -338,7 +338,14 @@ export default function App() {
 
         // Fallback to vocal onset alignment if macro scan empty
         if (lineAnchors.length === 0) {
-          lineAnchors = alignLyricsToVocalSegments(parsedLines, prep.analysis, audioInfo.duration, 'line');
+          const rawVocalLines = alignLyricsToVocalSegments(parsedLines, prep.analysis, audioInfo.duration, 'line');
+          lineAnchors = rawVocalLines.map((l, idx) => ({
+            id: `line-anchor-${idx + 1}-${Date.now()}`,
+            index: l.index,
+            text: l.text,
+            startTime: l.startTime,
+            endTime: l.endTime,
+          }));
         }
 
         setProgressStep(3);
@@ -359,14 +366,14 @@ export default function App() {
           setProgressPercent(pct);
 
           try {
-            // 3a. Slice exact millisecond audio portion for pure acoustic alignment
-            const { base64: chunkBase64 } = await sliceAudioBufferExact(
+            // 3a. Slice sub-segment with lookahead context to capture full vocal note decays
+            const chunkBase64 = await sliceAudioBufferWithContext(
               decodedBuffer,
               line.startTime,
               line.endTime
             );
 
-            // 3b. Fetch micro-timings from server proxy passing the clean audio snippet
+            // 3b. Fetch micro-timings from server proxy passing the context-aware audio snippet
             const response = await fetch('/api/precise-word-alignment', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
@@ -384,21 +391,42 @@ export default function App() {
               throw new Error("No relative words returned");
             }
 
-            relativeWords.forEach((item: any) => {
-              // Translate the pre-calibrated server timings back onto the absolute master timeline
-              const absoluteStart = line.startTime + item.relativeStart;
-              const absoluteEnd = line.startTime + item.relativeEnd;
+            relativeWords.forEach((item: any, idx: number) => {
+              // 1. COMPENSATE FOR LOOKAHEAD CONCONTEXT PADDING
+              // Pull the timestamps forward by the exact padding offset window used during slicing
+              const PROCESSING_LOOKAHEAD = 0.450; // Adjust this to match your slicer pre-window exactly
+
+              const absoluteStart = Math.max(0, line.startTime + item.relativeStart - PROCESSING_LOOKAHEAD);
+              const absoluteEnd = Math.max(0, line.startTime + item.relativeEnd - PROCESSING_LOOKAHEAD);
+
+              // 2. PREVENT TIMELINE INVERSION
+              // Ensure that endTime is always mathematically greater than startTime
+              let validatedEnd = absoluteEnd > absoluteStart ? absoluteEnd : absoluteStart + 0.180;
+
+              // 3. SECURE SEQUENTIAL STEP CONTINUITY
+              // Force the word to close cleanly when the next index block begins processing
+              const nextItem = relativeWords[idx + 1];
+              if (nextItem) {
+                const nextAbsoluteStart = Math.max(0, line.startTime + nextItem.relativeStart - PROCESSING_LOOKAHEAD);
+                if (validatedEnd > nextAbsoluteStart) {
+                  validatedEnd = nextAbsoluteStart;
+                }
+              } else {
+                if (validatedEnd > line.endTime) {
+                  validatedEnd = line.endTime;
+                }
+              }
 
               finalPrecisionWordCues.push({
                 id: `word-cue-${globalWordIndex}-${Date.now()}`,
                 index: globalWordIndex,
                 text: item.word,
-                startTime: +Math.min(line.endTime, absoluteStart).toFixed(3),
-                endTime: +Math.min(line.endTime, absoluteEnd).toFixed(3),
+                startTime: +absoluteStart.toFixed(3),
+                endTime: +validatedEnd.toFixed(3),
                 words: [{
                   word: item.word,
                   startTime: +absoluteStart.toFixed(3),
-                  endTime: +absoluteEnd.toFixed(3)
+                  endTime: +validatedEnd.toFixed(3)
                 }]
               });
               globalWordIndex++;

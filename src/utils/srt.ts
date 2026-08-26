@@ -479,11 +479,11 @@ export function applyLinguisticSmoothing(cues: any[]): any[] {
     const currentWord = current.words?.[0] || current;
     const nextWord = next.words?.[0] || next;
 
-    // Enforce strict sequential continuity: 
-    // The previous word ends the exact millisecond the next word begins
-    currentWord.endTime = nextWord.startTime;
+    // Lock sequential words together seamlessly to prevent early flickering
+    if (currentWord.endTime > nextWord.startTime) {
+      currentWord.endTime = nextWord.startTime;
+    }
 
-    // Re-map variables back to parent subtitle layer containers
     current.startTime = currentWord.startTime;
     current.endTime = currentWord.endTime;
   }

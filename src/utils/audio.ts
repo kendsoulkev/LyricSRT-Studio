@@ -98,91 +98,105 @@ export function analyzeVocalActivityAdvanced(buffer: AudioBuffer): VocalSegment[
     const x0 = rawData[i];
     const y0 = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
     filteredData[i] = y0;
-    x2 = x1; x1 = x0; y2 = y1; y1 = y0;
+    x2 = x1;
+    x1 = x0;
+    y2 = y1;
+    y1 = y0;
   }
 
-  const energies: number[] = new Array(numFrames);
-  const zcrRates: number[] = new Array(numFrames);
-  let totalEnergy = 0;
+  // 3. Frame-by-frame RMS and Zero-Crossing Rate (ZCR) computation
+  const energies = new Float32Array(numFrames);
+  const zcrs = new Float32Array(numFrames);
+  let maxEnergy = 0;
 
-  // 3. Compute Frame Energy (RMS) and Zero-Crossing Rate (ZCR)
   for (let f = 0; f < numFrames; f++) {
-    const offset = f * hopSize;
+    const start = f * hopSize;
     let sumSquares = 0;
     let zeroCrossings = 0;
 
     for (let i = 0; i < frameSize; i++) {
-      const idx = offset + i;
-      const currentSample = filteredData[idx];
-      const nextSample = filteredData[idx + 1] || 0;
-
-      sumSquares += currentSample * currentSample;
-
-      // Track Zero Crossings for tracking sharp consonant starts (fricatives)
-      if ((currentSample > 0 && nextSample < 0) || (currentSample < 0 && nextSample > 0)) {
+      const val = filteredData[start + i] || 0;
+      sumSquares += val * val;
+      if (i > 0 && ((val >= 0 && filteredData[start + i - 1] < 0) || (val < 0 && filteredData[start + i - 1] >= 0))) {
         zeroCrossings++;
       }
     }
 
     const rms = Math.sqrt(sumSquares / frameSize);
     energies[f] = rms;
-    zcrRates[f] = zeroCrossings / frameSize;
-    totalEnergy += rms;
+    zcrs[f] = zeroCrossings / frameSize;
+    if (rms > maxEnergy) maxEnergy = rms;
   }
 
-  const avgEnergy = totalEnergy / Math.max(1, numFrames);
-  const maxEnergy = Math.max(...energies, 0.001);
-  // Adaptive thresholding: Ignores heavy bass beats and background instrument floor noise
-  const energyThreshold = Math.max(avgEnergy * 0.50, maxEnergy * 0.09);
+  if (maxEnergy === 0) return [];
+
+  // Dynamic Energy Thresholding with Hysteresis (Voice Attack vs Silence Floor)
+  const onsetThreshold = maxEnergy * 0.12; // Lower threshold to catch soft singing breath onsets
+  const sustainThreshold = maxEnergy * 0.05; // Keep sustaining through soft vibrato decays
 
   const segments: VocalSegment[] = [];
-  let inSegment = false;
+  let inVoice = false;
   let segStartFrame = 0;
-  let peakFrame = 0;
-  let maxFrameEnergy = 0;
+  let segPeakEnergy = 0;
+  let segPeakFrame = 0;
 
   for (let f = 0; f < numFrames; f++) {
-    const e = energies[f];
-    const z = zcrRates[f];
+    const energy = energies[f];
+    const isVoicedFrame = energy >= (inVoice ? sustainThreshold : onsetThreshold);
 
-    // High ZCR values indicate a consonant start even if the musical volume is briefly lower
-    const isVocalActivity = e >= energyThreshold || (e > energyThreshold * 0.5 && z > 0.18);
-
-    if (isVocalActivity) {
-      if (!inSegment) {
-        inSegment = true;
-        segStartFrame = f;
-        maxFrameEnergy = e;
-        peakFrame = f;
-      } else if (e > maxFrameEnergy) {
-        maxFrameEnergy = e;
-        peakFrame = f;
+    if (!inVoice && isVoicedFrame) {
+      inVoice = true;
+      segStartFrame = f;
+      segPeakEnergy = energy;
+      segPeakFrame = f;
+    } else if (inVoice) {
+      if (energy > segPeakEnergy) {
+        segPeakEnergy = energy;
+        segPeakFrame = f;
       }
-    } else {
-      if (inSegment) {
-        const segDuration = ((f - segStartFrame) * hopSize) / sampleRate;
-        // Require a 180ms minimum duration to validate a human vocal syllable block
-        if (segDuration >= 0.18) {
-          segments.push({
-            startTime: +((segStartFrame * hopSize) / sampleRate).toFixed(3),
-            endTime: +((f * hopSize) / sampleRate).toFixed(3),
-            peakTime: +((peakFrame * hopSize) / sampleRate).toFixed(3),
-            energy: +(maxFrameEnergy / maxEnergy).toFixed(3),
-          });
+
+      if (!isVoicedFrame) {
+        // Check if this is just a brief micro-pause (e.g., stop consonant 'p', 't', 'k')
+        const lookaheadFrames = Math.min(numFrames - f - 1, 15); // 150ms lookahead
+        let resumesQuickly = false;
+        for (let k = 1; k <= lookaheadFrames; k++) {
+          if (energies[f + k] >= onsetThreshold) {
+            resumesQuickly = true;
+            break;
+          }
         }
-        inSegment = false;
+
+        if (!resumesQuickly) {
+          inVoice = false;
+          const startTime = (segStartFrame * hopSize) / sampleRate;
+          const endTime = (f * hopSize + frameSize) / sampleRate;
+          const peakTime = (segPeakFrame * hopSize) / sampleRate;
+
+          // Filter out transient clicks/noise < 80ms
+          if (endTime - startTime >= 0.08) {
+            segments.push({
+              startTime: +startTime.toFixed(3),
+              endTime: +endTime.toFixed(3),
+              peakTime: +peakTime.toFixed(3),
+              energy: +(segPeakEnergy / maxEnergy).toFixed(3),
+            });
+          }
+        }
       }
     }
   }
 
-  if (inSegment) {
-    const segDuration = ((numFrames - segStartFrame) * hopSize) / sampleRate;
-    if (segDuration >= 0.18) {
+  // Close unfinalized trailing segment
+  if (inVoice) {
+    const startTime = (segStartFrame * hopSize) / sampleRate;
+    const endTime = (numFrames * hopSize + frameSize) / sampleRate;
+    const peakTime = (segPeakFrame * hopSize) / sampleRate;
+    if (endTime - startTime >= 0.08) {
       segments.push({
-        startTime: +((segStartFrame * hopSize) / sampleRate).toFixed(3),
-        endTime: +buffer.duration.toFixed(3),
-        peakTime: +((peakFrame * hopSize) / sampleRate).toFixed(3),
-        energy: +(maxFrameEnergy / maxEnergy).toFixed(3),
+        startTime: +startTime.toFixed(3),
+        endTime: +endTime.toFixed(3),
+        peakTime: +peakTime.toFixed(3),
+        energy: +(segPeakEnergy / maxEnergy).toFixed(3),
       });
     }
   }
@@ -248,133 +262,43 @@ export function alignLyricsToVocalSegments(
     let start = nearestSegment ? nearestSegment.startTime : targetApproxTime;
     let end = nearestSegment
       ? Math.min(totalDuration, nearestSegment.endTime + 0.3)
-      : Math.min(totalDuration, start + step * 0.88);
+      : Math.min(totalDuration, targetApproxTime + Math.min(step * 0.9, 3.5));
+
+    // Ensure strictly increasing start times
+    if (i > 0) {
+      const prevEst = startOffset + (i - 0.5) * step;
+      if (start <= prevEst) {
+        start = prevEst + 0.1;
+      }
+    }
 
     if (end <= start) {
       end = Math.min(totalDuration, start + 2.0);
     }
 
-    // Ensure monotonically increasing
-    start = Math.max(0, start);
-    end = Math.min(totalDuration, end);
-
-    let words = undefined;
-    if (mode === 'word') {
-      const rawWords = text.split(/\s+/).filter(Boolean);
-      if (rawWords.length > 0) {
-        const weights = rawWords.map((w) => {
-          const clean = w.toLowerCase().replace(/[^a-z0-9]/g, '');
-          const vowels = clean.match(/[aeiouy]{1,2}/g);
-          let syl = vowels ? vowels.length : 1;
-          if (clean.endsWith('e') && !clean.endsWith('le') && syl > 1) syl -= 1;
-          return Math.max(1, syl);
-        });
-        const totalW = weights.reduce((a, b) => a + b, 0);
-        const lineDuration = end - start;
-
-        let wCurrent = start;
-        words = rawWords.map((w, wIdx) => {
-          const span = (weights[wIdx] / totalW) * lineDuration;
-          const wStart = wCurrent;
-          const wEnd = wIdx === rawWords.length - 1 ? end : wCurrent + span;
-          wCurrent = wEnd;
-          return {
-            word: w,
-            startTime: +wStart.toFixed(3),
-            endTime: +wEnd.toFixed(3),
-          };
-        });
-      }
-    }
-
     return {
-      id: `cue-${i + 1}-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
       index: i + 1,
-      text,
-      startTime: +start.toFixed(3),
-      endTime: +end.toFixed(3),
-      words,
+      text: text.trim(),
+      startTime: +start.toFixed(2),
+      endTime: +end.toFixed(2),
     };
   });
 }
 
-// Convert AudioBuffer to a standard PCM 16-bit WAV Blob
-export function audioBufferToWavBlob(buffer: AudioBuffer): Blob {
-  const numChannels = buffer.numberOfChannels;
-  const sampleRate = buffer.sampleRate;
-  const format = 1; // PCM
-  const bitDepth = 16;
-  const channelData = [];
-
-  for (let i = 0; i < numChannels; i++) {
-    channelData.push(buffer.getChannelData(i));
-  }
-
-  const numSamples = buffer.length;
-  const byteRate = (sampleRate * numChannels * bitDepth) / 8;
-  const blockAlign = (numChannels * bitDepth) / 8;
-  const bufferLength = 44 + numSamples * numChannels * (bitDepth / 8);
-  const outBuffer = new ArrayBuffer(bufferLength);
-  const view = new DataView(outBuffer);
-
-  // RIFF identifier
-  writeString(view, 0, 'RIFF');
-  // RIFF chunk length
-  view.setUint32(4, 36 + numSamples * numChannels * (bitDepth / 8), true);
-  // RIFF type
-  writeString(view, 8, 'WAVE');
-  // format chunk identifier
-  writeString(view, 12, 'fmt ');
-  // format chunk length
-  view.setUint32(16, 16, true);
-  // sample format (PCM)
-  view.setUint16(20, format, true);
-  // channel count
-  view.setUint16(22, numChannels, true);
-  // sample rate
-  view.setUint32(24, sampleRate, true);
-  // byte rate (sample rate * block align)
-  view.setUint32(28, byteRate, true);
-  // block align (channel count * bytes per sample)
-  view.setUint16(32, blockAlign, true);
-  // bits per sample
-  view.setUint16(34, bitDepth, true);
-  // data chunk identifier
-  writeString(view, 36, 'data');
-  // data chunk length
-  view.setUint32(40, numSamples * numChannels * (bitDepth / 8), true);
-
-  // Write interleaved PCM samples
-  let offset = 44;
-  for (let i = 0; i < numSamples; i++) {
-    for (let channel = 0; channel < numChannels; channel++) {
-      let sample = channelData[channel][i];
-      // Clamp between -1 and 1
-      sample = Math.max(-1, Math.min(1, sample));
-      // Scale to 16-bit signed int
-      const intSample = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
-      view.setInt16(offset, intSample, true);
-      offset += 2;
-    }
-  }
-
-  return new Blob([outBuffer], { type: 'audio/wav' });
-}
-
 /**
- * Slices an exact sub-segment from an AudioBuffer without artificial silence padding
- * to provide pure acoustic frames for local forced alignment.
+ * Extracts an EXACT sub-segment from an AudioBuffer without artificial silent padding.
+ * Renders the exact audio time window [startTime, endTime] directly to a Base64 WAV string.
  */
 export async function sliceAudioBufferExact(
   parentBuffer: AudioBuffer,
   startTime: number,
   endTime: number
-): Promise<{ base64: string; duration: number }> {
+): Promise<{ base64: string }> {
   const sampleRate = parentBuffer.sampleRate;
-  const safeStart = Math.max(0, startTime);
-  const safeEnd = Math.min(parentBuffer.duration, Math.max(safeStart + 0.05, endTime));
-  const startSample = Math.floor(safeStart * sampleRate);
-  const endSample = Math.ceil(safeEnd * sampleRate);
+  const safeStartTime = Math.max(0, startTime);
+  const safeEndTime = Math.min(parentBuffer.duration, Math.max(safeStartTime + 0.05, endTime));
+  const startSample = Math.floor(safeStartTime * sampleRate);
+  const endSample = Math.ceil(safeEndTime * sampleRate);
   const frameLength = Math.max(1, endSample - startSample);
 
   const offlineCtx = new OfflineAudioContext(
@@ -386,21 +310,51 @@ export async function sliceAudioBufferExact(
   const source = offlineCtx.createBufferSource();
   source.buffer = parentBuffer;
   source.connect(offlineCtx.destination);
-  source.start(0, safeStart, (endSample - startSample) / sampleRate);
+  source.start(0, safeStartTime, (endSample - startSample) / sampleRate);
 
   const renderedChunk = await offlineCtx.startRendering();
   const wavBlob = audioBufferToWavBlob(renderedChunk);
   const base64 = await blobToBase64(wavBlob);
 
-  return {
-    base64,
-    duration: frameLength / sampleRate,
-  };
+  return { base64 };
 }
 
 /**
- * Upgraded Micro-Slicer with Leading Silence Calibration Injection.
- * Eliminates the AI initialization lag penalty.
+ * Extracts a sub-segment from an AudioBuffer with lookahead context handles.
+ * Prevents cloud machine learning models from truncating final line words.
+ */
+export async function sliceAudioBufferWithContext(
+  parentBuffer: AudioBuffer,
+  startTime: number,
+  endTime: number
+): Promise<string> {
+  const sampleRate = parentBuffer.sampleRate;
+  
+  // Provide 1.2 seconds of trailing acoustic lookahead context
+  const TRAILING_CONTEXT = 1.200; 
+  const adjustedEndTime = Math.min(parentBuffer.duration, endTime + TRAILING_CONTEXT);
+  const frameLength = Math.ceil((adjustedEndTime - startTime) * sampleRate);
+
+  const offlineCtx = new OfflineAudioContext(
+    parentBuffer.numberOfChannels,
+    frameLength,
+    sampleRate
+  );
+
+  const source = offlineCtx.createBufferSource();
+  source.buffer = parentBuffer;
+  
+  source.connect(offlineCtx.destination);
+  source.start(0, startTime, adjustedEndTime - startTime);
+
+  const renderedChunk = await offlineCtx.startRendering();
+  const wavBlob = audioBufferToWavBlob(renderedChunk);
+  return await blobToBase64(wavBlob);
+}
+
+/**
+ * Slices an exact sub-segment from an AudioBuffer and injects a 500ms lead-in of pure digital silence.
+ * This guarantees the ML / acoustic model receives a pristine zero-energy floor before the true vocal onset.
  */
 export async function sliceAudioBufferWithSilence(
   parentBuffer: AudioBuffer,
@@ -598,45 +552,51 @@ export async function generateDemoSong(lyricsLines: string[]): Promise<{ blob: B
       osc.frequency.setValueAtTime(120, t);
       osc.frequency.exponentialRampToValueAtTime(30, t + 0.15);
       gain.gain.setValueAtTime(0.3, t);
-      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.15);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.2);
     } else {
-      osc.type = 'sawtooth';
+      osc.type = 'square';
       osc.frequency.setValueAtTime(250, t);
-      gain.gain.setValueAtTime(0.12, t);
-      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.1);
+      gain.gain.setValueAtTime(0.08, t);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.15);
     }
 
     osc.connect(gain);
     gain.connect(offlineCtx.destination);
     osc.start(t);
-    osc.stop(t + 0.2);
+    osc.stop(t + 0.25);
   }
 
-  // Melodic lead guiding each lyric line
-  lyricsLines.forEach((_, index) => {
-    const lineStart = introDuration + index * lineDuration;
-    const melodyNotes = [523.25, 587.33, 659.25, 783.99]; // C5, D5, E5, G5
+  // Add a synthesized vocal-like lead melody (sine + vibrato) singing the lyrics timing
+  lyricsLines.forEach((_, idx) => {
+    const lineStart = introDuration + idx * lineDuration;
+    const notesPerLine = 4;
+    const noteDur = (lineDuration - 0.4) / notesPerLine;
+    const scale = [261.63, 293.66, 329.63, 349.23, 392.0, 440.0];
 
-    for (let n = 0; n < 4; n++) {
-      const noteTime = lineStart + n * 0.65;
+    for (let n = 0; n < notesPerLine; n++) {
+      const nStart = lineStart + n * noteDur;
       const osc = offlineCtx.createOscillator();
       const gain = offlineCtx.createGain();
-      osc.type = 'sine';
-      osc.frequency.setValueAtTime(melodyNotes[(index + n) % melodyNotes.length], noteTime);
 
-      gain.gain.setValueAtTime(0, noteTime);
-      gain.gain.linearRampToValueAtTime(0.12, noteTime + 0.05);
-      gain.gain.exponentialRampToValueAtTime(0.001, noteTime + 0.55);
+      osc.type = 'sine';
+      const freq = scale[(idx * 2 + n) % scale.length];
+      osc.frequency.setValueAtTime(freq, nStart);
+
+      // Formant & Envelope
+      gain.gain.setValueAtTime(0, nStart);
+      gain.gain.linearRampToValueAtTime(0.18, nStart + 0.05);
+      gain.gain.setValueAtTime(0.15, nStart + noteDur - 0.05);
+      gain.gain.linearRampToValueAtTime(0, nStart + noteDur);
 
       osc.connect(gain);
       gain.connect(offlineCtx.destination);
-      osc.start(noteTime);
-      osc.stop(noteTime + 0.6);
+      osc.start(nStart);
+      osc.stop(nStart + noteDur);
     }
   });
 
-  const rendered = await offlineCtx.startRendering();
-  const wavBlob = audioBufferToWavBlob(rendered);
+  const renderedBuffer = await offlineCtx.startRendering();
+  const wavBlob = audioBufferToWavBlob(renderedBuffer);
   const url = URL.createObjectURL(wavBlob);
 
   return {
@@ -688,94 +648,48 @@ export function refineWordTimestampsWithVocalOnsets(
     words: c.words ? c.words.map(w => ({ ...w })) : undefined
   }));
 
+  const frameHopSec = 0.005; // 5ms step resolution
+  const frameWindowSec = 0.020; // 20ms integration window
+  const frameSamples = Math.floor(frameWindowSec * sampleRate);
+
+  const getEnergy = (timeSec: number) => {
+    const startIdx = Math.floor(timeSec * sampleRate);
+    if (startIdx < 0 || startIdx + frameSamples >= filteredData.length) return 0;
+    let sum = 0;
+    for (let i = 0; i < frameSamples; i++) {
+      const s = filteredData[startIdx + i];
+      sum += s * s;
+    }
+    return Math.sqrt(sum / frameSamples);
+  };
+
   for (let i = 0; i < refinedCues.length; i++) {
     const current = refinedCues[i];
     const prev = i > 0 ? refinedCues[i - 1] : null;
-    const wordText = current.text || (current.words && current.words[0]?.word) || `Word ${i + 1}`;
+    const wordText = current.text.trim();
     const origStart = current.startTime;
 
-    // Search window: [origStart - 120ms, origStart - 15ms]
-    const windowStartSec = Math.max(0, origStart - MAX_EARLIER_CORRECTION_SEC);
-    const windowEndSec = Math.max(0, origStart - 0.015);
+    // Lookback window: [origStart - 120ms, origStart - 15ms]
+    const lookbackStart = Math.max(0, origStart - MAX_EARLIER_CORRECTION_SEC);
+    const lookbackEnd = Math.max(0, origStart - 0.015);
 
-    if (windowEndSec <= windowStartSec) {
-      console.log(
-        `[WordTiming]\nWord: "${wordText}"\nOriginal start: ${origStart.toFixed(3)}\nDetected onset: none\nCorrection: 0.000\nConfidence: 0.00\nApplied: NO\nReason: search window too small`
-      );
-      continue;
-    }
+    if (lookbackEnd <= lookbackStart) continue;
 
-    // Extract micro-frames: 10ms frame with 2.5ms hop
-    const frameSize = Math.floor(sampleRate * 0.010);
-    const hopSize = Math.floor(sampleRate * 0.0025);
+    // Measure pre-window baseline energy (quiet noise floor)
+    const baselineEnergy = getEnergy(Math.max(0, lookbackStart - 0.040));
 
-    // Look at an analysis region starting 80ms before windowStartSec up to 80ms after origStart
-    const analysisRegionStart = Math.max(0, windowStartSec - 0.080);
-    const analysisRegionEnd = Math.min(audioBuffer.duration, origStart + 0.080);
-
-    const startSample = Math.floor(analysisRegionStart * sampleRate);
-    const endSample = Math.floor(analysisRegionEnd * sampleRate);
-    const regionLength = endSample - startSample;
-
-    if (regionLength < frameSize * 3) {
-      console.log(
-        `[WordTiming]\nWord: "${wordText}"\nOriginal start: ${origStart.toFixed(3)}\nDetected onset: none\nCorrection: 0.000\nConfidence: 0.00\nApplied: NO\nReason: insufficient audio samples in region`
-      );
-      continue;
-    }
-
-    const numFrames = Math.floor((regionLength - frameSize) / hopSize);
-    const frameEnergies: number[] = new Array(numFrames);
-    const frameZcr: number[] = new Array(numFrames);
-    const frameTimes: number[] = new Array(numFrames);
-
-    for (let f = 0; f < numFrames; f++) {
-      const offset = startSample + f * hopSize;
-      let sumSq = 0;
-      let crossings = 0;
-      for (let s = 0; s < frameSize; s++) {
-        const sIdx = offset + s;
-        const val = filteredData[sIdx] || 0;
-        const nextVal = filteredData[sIdx + 1] || 0;
-        sumSq += val * val;
-        if ((val > 0 && nextVal < 0) || (val < 0 && nextVal > 0)) {
-          crossings++;
-        }
-      }
-      frameEnergies[f] = Math.sqrt(sumSq / frameSize);
-      frameZcr[f] = crossings / frameSize;
-      frameTimes[f] = (offset + frameSize / 2) / sampleRate;
-    }
-
-    // Baseline background energy before windowStart
-    const preWindowFrames = frameEnergies.filter((_, idx) => frameTimes[idx] < windowStartSec);
-    const baselineEnergy = preWindowFrames.length > 0
-      ? preWindowFrames.reduce((a, b) => a + b, 0) / preWindowFrames.length
-      : 0.001;
-
-    // Search for sharpest valid vocal onset candidate in [windowStartSec, windowEndSec]
     let bestCandidateTime: number | null = null;
     let bestConfidence = 0;
 
-    for (let f = 1; f < numFrames - 2; f++) {
-      const t = frameTimes[f];
-      if (t < windowStartSec || t > windowEndSec) continue;
+    for (let t = lookbackStart; t <= lookbackEnd; t += frameHopSec) {
+      const ePre = getEnergy(t - 0.015);
+      const ePost = getEnergy(t + 0.015);
+      const eFuture = getEnergy(t + 0.035); // sustain check
 
-      const ePre = (frameEnergies[f - 1] + frameEnergies[Math.max(0, f - 2)]) / 2;
-      const eCur = frameEnergies[f];
-      const ePost = (frameEnergies[f + 1] + frameEnergies[Math.min(numFrames - 1, f + 2)]) / 2;
-      const zcr = frameZcr[f];
-
-      // Energy rise ratio
-      const energyGain = eCur - ePre;
-      const relativeRise = ePre > 0 ? (eCur - ePre) / ePre : (eCur > 0.01 ? 2.0 : 0);
-
-      // Check for vocal sustain in post-onset window (ensures not a fleeting percussive click)
-      const isSustained = ePost >= eCur * 0.70 || ePost > baselineEnergy * 1.8;
-
-      // Consonant friction or formant onset
-      const isAcousticOnset = (energyGain > 0.005 && relativeRise > 0.65 && isSustained) ||
-                              (zcr > 0.20 && eCur > baselineEnergy * 1.2 && isSustained);
+      // Check for sharp onset rise & sustained energy (filters out click artifacts)
+      const energyDelta = ePost - ePre;
+      const relativeRise = ePost / (Math.max(0.005, ePre) + 1e-4);
+      const isAcousticOnset = energyDelta > 0.015 && relativeRise >= 1.6 && eFuture >= ePost * 0.7;
 
       if (isAcousticOnset) {
         // Compute confidence metric based on sharpness, sustain, and VAD alignment
@@ -832,4 +746,56 @@ export function refineWordTimestampsWithVocalOnsets(
   return refinedCues;
 }
 
+// Convert AudioBuffer to WAV Blob
+export function audioBufferToWavBlob(buffer: AudioBuffer): Blob {
+  const numChannels = buffer.numberOfChannels;
+  const sampleRate = buffer.sampleRate;
+  const format = 1; // PCM
+  const bitDepth = 16;
+  const bytesPerSample = bitDepth / 8;
+  const blockAlign = numChannels * bytesPerSample;
 
+  const length = buffer.length * numChannels * bytesPerSample;
+  const arrayBuffer = new ArrayBuffer(44 + length);
+  const view = new DataView(arrayBuffer);
+
+  /* RIFF identifier */
+  writeString(view, 0, 'RIFF');
+  /* RIFF chunk length */
+  view.setUint32(4, 36 + length, true);
+  /* RIFF type */
+  writeString(view, 8, 'WAVE');
+  /* format chunk identifier */
+  writeString(view, 12, 'fmt ');
+  /* format chunk length */
+  view.setUint32(16, 16, true);
+  /* sample format (raw) */
+  view.setUint16(20, format, true);
+  /* channel count */
+  view.setUint16(22, numChannels, true);
+  /* sample rate */
+  view.setUint32(24, sampleRate, true);
+  /* byte rate (sample rate * block align) */
+  view.setUint32(28, sampleRate * blockAlign, true);
+  /* block align (channel count * bytes per sample) */
+  view.setUint16(32, blockAlign, true);
+  /* bits per sample */
+  view.setUint16(34, bitDepth, true);
+  /* data chunk identifier */
+  writeString(view, 36, 'data');
+  /* data chunk length */
+  view.setUint32(40, length, true);
+
+  // Interleave and convert float [-1, 1] to 16-bit signed integer
+  let offset = 44;
+  for (let i = 0; i < buffer.length; i++) {
+    for (let channel = 0; channel < numChannels; channel++) {
+      const sample = Math.max(-1, Math.min(1, buffer.getChannelData(channel)[i]));
+      const intSample = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+      view.setInt16(offset, intSample, true);
+      offset += 2;
+    }
+  }
+
+  return new Blob([view], { type: 'audio/wav' });
+}
