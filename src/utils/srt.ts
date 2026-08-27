@@ -234,7 +234,11 @@ export function triggerDownload(filename: string, content: string, mimeType = 't
  * Map clean Gemini word-level forced alignment response directly into app subtitle cues.
  */
 export function formatGeminiResponseToCues(geminiOutput: GeminiWord[]): SubtitleCue[] {
-  return geminiOutput.map((item, index) => {
+  // If the Gemini model flags early vocal segments as humming space (isVerbalSpeech === false),
+  // filter it out so text remains hidden until actual speech starts
+  const validatedWords = (geminiOutput || []).filter((item) => item.isVerbalSpeech !== false);
+
+  return validatedWords.map((item, index) => {
     return {
       id: `cue-${index + 1}-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
       index: index + 1,
@@ -246,6 +250,7 @@ export function formatGeminiResponseToCues(geminiOutput: GeminiWord[]): Subtitle
           word: item.word,
           startTime: item.startTime,
           endTime: item.endTime,
+          isVerbalSpeech: item.isVerbalSpeech,
         },
       ],
     };
@@ -466,28 +471,21 @@ export function snapAiWordsToLocalVad(
 }
 
 /**
- * High-Precision Subtitle Continuous Flow Sequencer
- * Removes timing gaps between words to eliminate lingering text and irregular jumps.
+ * Pure Safety Pass-Through Smoothing Pass
+ * Prevents overlapping boundaries without distorting the underlying timeline data.
  */
-export function applyLinguisticSmoothing(cues: any[]): any[] {
+export function applyLinguisticSmoothing(cues: SubtitleCue[]): SubtitleCue[] {
   if (cues.length <= 1) return cues;
 
   for (let i = 0; i < cues.length - 1; i++) {
     const current = cues[i];
     const next = cues[i + 1];
 
-    const currentWord = current.words?.[0] || current;
-    const nextWord = next.words?.[0] || next;
-
-    // Lock sequential words together seamlessly to prevent early flickering
-    if (currentWord.endTime > nextWord.startTime) {
-      currentWord.endTime = nextWord.startTime;
+    // Simple collision block to protect playback rendering tracks
+    if (current.endTime > next.startTime) {
+      current.endTime = next.startTime;
     }
-
-    current.startTime = currentWord.startTime;
-    current.endTime = currentWord.endTime;
   }
-
   return cues;
 }
 
@@ -540,8 +538,8 @@ export function maskIntroHummingSegments(
 }
 
 /**
- * Clean Intro Structural Gate
- * Shields the intro window from premature text triggers by mapping early items to the first spoken onset.
+ * Scope-Restricted Production Intro Speech Gate
+ * Protects instrumental/humming introductions while shielding later verses from timeline shifts.
  */
 export function applyIntroSpeechGate(
   cues: SubtitleCue[],
@@ -549,12 +547,17 @@ export function applyIntroSpeechGate(
 ): SubtitleCue[] {
   if (!cues || cues.length === 0 || trueSpeechOnset <= 0) return cues;
 
-  return cues.map((cue) => {
+  // Find the absolute boundary edge of the first structural verse line
+  const firstLineCeiling = cues[0].endTime;
+
+  return cues.map((cue, idx) => {
     const wordObj = cue.words?.[0] || { startTime: cue.startTime, endTime: cue.endTime, word: cue.text };
 
-    // If the synchronization engine positioned a word early inside the humming or intro block,
-    // hold its display back until the playhead crosses the true spoken attack boundary.
-    if (wordObj.startTime < trueSpeechOnset) {
+    // RULE: Only apply the humming filter gate if the word falls inside the initial opening line wrapper.
+    // If the word occurs past the first line's boundary, leave it completely untouched!
+    if (wordObj.startTime < trueSpeechOnset && wordObj.startTime <= firstLineCeiling) {
+      console.log(`[Gate Active] Gating intro word "${wordObj.word}" to true onset: ${trueSpeechOnset}s`);
+
       const originalDuration = wordObj.endTime - wordObj.startTime;
       const adjustedStart = trueSpeechOnset;
       const adjustedEnd = adjustedStart + Math.max(0.180, originalDuration);
@@ -571,6 +574,7 @@ export function applyIntroSpeechGate(
       };
     }
 
+    // Pass all subsequent words through with 100% pure unaltered ML timestamp data
     return cue;
   });
 }

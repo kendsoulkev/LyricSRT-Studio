@@ -493,21 +493,49 @@ export default function App() {
               );
             }
 
-            relativeWords.forEach((item: any, idx: number) => {
-              // REMOVED: - PROCESSING_LOOKAHEAD
-              // Because your browser slicer starts exactly at line.startTime, 
-              // item.relativeStart must be added directly without artificial shifts!
+            // Filter out non-verbal humming tracks flagged by the model (isVerbalSpeech === false)
+            const validatedWords = relativeWords.filter((item: any) => item.isVerbalSpeech !== false);
+            if (validatedWords.length === 0) {
+              throw new Error(`No verbal speech segments identified for line ${i + 1}`);
+            }
+
+            validatedWords.forEach((item: any, idx: number) => {
+              // 1. ELIMINATE ALL STRING-MATCHING SEARCH LOOPS
+              // We ignore the text value "you" and lock alignment strictly to array sequence indices [idx].
+              // This creates an absolute firewall preventing Word #1 from stealing timestamps from Word #4.
               const absoluteStart = line.startTime + item.relativeStart;
               const absoluteEnd = line.startTime + item.relativeEnd;
 
-              // Protect sequential progression and bridge gaps fluidly
-              const nextItem = relativeWords[idx + 1];
-              const validatedEnd = nextItem ? (line.startTime + nextItem.relativeStart) : absoluteEnd;
+              // 2. MONOTONIC PROGRESSION & TIME-INVERSION GUARD
+              // Ensure every word moves forward chronologically by at least a 150ms visibility window
+              let validatedEnd = absoluteEnd > absoluteStart ? absoluteEnd : absoluteStart + 0.150;
+
+              // 3. STRICT INDEX-CHAINED EDGE STEPPING
+              // Access the subsequent item explicitly using index pointer offsets [idx + 1]
+              const nextItem = validatedWords[idx + 1];
+              if (nextItem) {
+                const nextAbsoluteStart = line.startTime + nextItem.relativeStart;
+                
+                // If a word's duration bleeds forward, snap it precisely to the next word's true onset edge
+                if (validatedEnd > nextAbsoluteStart) {
+                  validatedEnd = nextAbsoluteStart > absoluteStart ? nextAbsoluteStart : absoluteStart + 0.150;
+                }
+              } else {
+                // If it is the absolute final word token of this line chunk, clamp it safely to the macro ceiling
+                if (validatedEnd > line.endTime) {
+                  if (line.endTime > absoluteStart) {
+                    validatedEnd = line.endTime;
+                  } else {
+                    // If the parent container ceiling is too tight, flex it forward instead of crushing the word backwards!
+                    validatedEnd = absoluteStart + 0.200;
+                  }
+                }
+              }
 
               finalPrecisionWordCues.push({
                 id: `word-cue-${globalWordIndex}-${Date.now()}`,
                 index: globalWordIndex,
-                text: item.word,
+                text: item.word, // Maps the exact verbatim string relative to its pristine array slot index
                 startTime: +absoluteStart.toFixed(3),
                 endTime: +validatedEnd.toFixed(3),
                 words: [{
@@ -546,26 +574,12 @@ export default function App() {
         setProgressText("Finalizing zero-drift subtitle cues & acoustic onsets...");
         setProgressPercent(100);
 
-        // Apply conservative late-word onset refinement (only shifts earlier if strong acoustic evidence exists)
-        const refinedWordCues = ENABLE_WORD_ONSET_REFINEMENT
-          ? refineWordTimestampsWithVocalOnsets(finalPrecisionWordCues, decodedBuffer, prep.analysis.vocalSegments)
-          : finalPrecisionWordCues;
-
-        // 1. Process continuous flow spacing constraints locally
-        let optimizedTimeline = applyLinguisticSmoothing(refinedWordCues);
-
-        // 2. Identify the absolute spoken consonant onset boundary bypassing the humming noise floor
-        const trueSpeechOnsetMarker = detectTrueSpeechOnset(
-          decodedBuffer, 
-          prep.analysis.vocalSegments
-        );
-
-        // 3. Apply the structural gate pass to protect your intro timeline track
-        optimizedTimeline = applyIntroSpeechGate(optimizedTimeline, trueSpeechOnsetMarker);
-        optimizedTimeline = maskIntroHummingSegments(optimizedTimeline, prep.analysis.vocalSegments);
-
-        // 4. Update your primary UI state container
-        setCues(optimizedTimeline);
+        // ============================================================================
+        // CRITICAL BYPASS: DEACTIVATE ALL EXTERNAL SMOOTHING HUBS RIGHT HERE
+        // Pure ML data sent straight to primary state with zero local distortions.
+        // ============================================================================
+        setCues(finalPrecisionWordCues);
+        console.log("🏁 Pure ML data successfully rendered with zero local distortions.");
         setInitialAlignmentDone(true);
         setFirstLineManuallySet(false);
         setFirstLineAnchor(null);

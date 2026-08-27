@@ -4,6 +4,7 @@ export interface WordTiming {
   word: string;
   startTime: number; // in seconds
   endTime: number; // in seconds
+  isVerbalSpeech?: boolean;
   acousticScore?: number; // 0 - 100 acoustic WAV correlation score
   candidateAi?: { startTime: number; endTime: number; score: number };
   candidateAcoustic?: { startTime: number; endTime: number; score: number };
@@ -14,6 +15,7 @@ export interface GeminiWord {
   word: string;
   startTime: number;
   endTime: number;
+  isVerbalSpeech?: boolean;
 }
 
 export interface VocalSegment {

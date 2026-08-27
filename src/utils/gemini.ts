@@ -25,30 +25,25 @@ export async function fetchPreciseWordAlignment(
   if (config?.apiKey) {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${config.apiKey}`;
 
-    const chunkSystemInstruction = `You are a high-precision phonetic micro-aligner processing a short 3-6 second audio snippet.
-Your sole job is to distribute the words of the provided text sequentially across the clip timeline.
+    const chunkSystemInstruction = `You are an expert, sub-second phonetic subtitle alignment system processing a short 3-6 second audio snippet. Your sole task is to align the provided verbatim text lyrics to the exact millisecond they are clearly articulated in the audio track.
 
-CRITICAL RULES FOR ACCURACY:
-1. CONTINUOUS TIMELINES: The "relativeStart" of a word must exactly equal the "relativeEnd" of the previous word. Do not leave accidental gaps or structural holes in the middle of a continuous sentence.
-2. VERBATIM COUNTS: You must output exactly one JSON object for every individual word in the target line string. Do not alter text or combine separate words into a single element.`;
+CRITICAL TIMING & VERBAL LAWS:
+1. HUMMING IS NOT SPEECH: Do not map written words onto introductory humming, vocal ad-libs without text ("Mmmm", "Ooh", "Aah"), or instrumental sections. Set "isVerbalSpeech" to false ONLY if a timing block represents instrumental space or non-verbal humming tracks. Set to true for all actual spoken or sung lyrics.
+2. EXPLICIT ONSET REQUIREMENT: The "relativeStart" of the very first word must reflect the exact millisecond the first consonant sound is clearly formed by the speaker/singer (consonant attack onset).
+3. CONTINUOUS TIMELINES: The "relativeStart" of a word must sequentially follow the "relativeEnd" of the previous word.
+4. VERBATIM COUNTS: You must output exactly one JSON object for every individual word in the target line string. Do not alter text or combine separate words into a single element.`;
+
+    const wordSystemInstruction = `You are an expert, sub-second phonetic subtitle alignment system. Your sole task is to align the provided verbatim text lyrics to the exact millisecond they are clearly articulated in the audio track.
+
+CRITICAL TIMING & VERBAL LAWS:
+1. HUMMING IS NOT SPEECH: Do not map written words onto introductory humming, vocal ad-libs without text ("Mmmm", "Ooh", "Aah"), or instrumental sections. 
+2. EXPLICIT ONSET REQUIREMENT: The "startTime" of the very first word must reflect the exact millisecond the first consonant sound is clearly formed by the speaker/singer (consonant attack onset). If the song has an instrumental or humming intro that lasts 12.4 seconds, your first word entry MUST NOT start before 12.400.
+3. GAP IDENTIFICATION: If there is a distinct musical pause or long sustained note fade between words, do not stretch the previous word artificially late. Allow absolute silence spaces to remain blank on the timeline.`;
 
     const systemInstruction = isMicroChunkMode
       ? chunkSystemInstruction
       : isWordMode
-      ? `You are an advanced Audio-to-Lyric Forced Alignment engine running at the INDIVIDUAL WORD level. 
-Your goal is to map the user-provided reference text perfectly to the spoken or sung words in the uploaded audio file.
-
-OUTPUT FORMAT REQUIREMENTS:
-You must output a single, valid JSON array containing objects structured exactly like this example, with absolute millisecond precision. Do not wrap the JSON output in markdown blocks or include any conversational text:
-[
-  { "word": "Hello", "startTime": 1.240, "endTime": 1.620 },
-  { "word": "world", "startTime": 1.650, "endTime": 2.110 }
-]
-
-CRITICAL RULES FOR ACCURACY:
-1. STRICT WORD SEPARATION: Output a separate JSON object for EVERY individual word found in the reference text. Do not group words together.
-2. TIME BOUNDARIES: Identify exactly when each word starts and stops down to the millisecond.
-3. VERBATIM MATCHING: Use only the exact words provided in the text input.`
+      ? wordSystemInstruction
       : `You are an advanced Audio-to-Lyric Line Aligner. Your sole job is to take the provided .wav audio file and the exact list of lyric lines provided by the user, and find the start and end timestamps for each full line.
 
 OUTPUT FORMAT REQUIREMENTS:
@@ -59,27 +54,55 @@ You must output a single, valid JSON array containing objects structured exactly
 
     const chunkResponseSchema = {
       type: 'ARRAY',
+      description: 'Sequential chronological list of every individual word token spoken in the track.',
       items: {
         type: 'OBJECT',
         properties: {
-          word: { type: 'STRING' },
-          relativeStart: { type: 'NUMBER' },
-          relativeEnd: { type: 'NUMBER' },
+          word: {
+            type: 'STRING',
+            description: 'The exact verbatim word from the lyric sheet.'
+          },
+          relativeStart: {
+            type: 'NUMBER',
+            description: 'Start time in seconds relative to the start of this short clip (0.0)'
+          },
+          relativeEnd: {
+            type: 'NUMBER',
+            description: 'End time in seconds relative to the start of this short clip'
+          },
+          isVerbalSpeech: {
+            type: 'BOOLEAN',
+            description: 'Set to false ONLY if this timing block represents instrumental space or non-verbal humming tracks. Set to true for all actual spoken or sung lyrics.'
+          }
         },
-        required: ['word', 'relativeStart', 'relativeEnd'],
+        required: ['word', 'relativeStart', 'relativeEnd', 'isVerbalSpeech'],
       },
     };
 
     const wordResponseSchema = {
       type: 'ARRAY',
+      description: 'Sequential chronological list of every individual word token spoken in the track.',
       items: {
         type: 'OBJECT',
         properties: {
-          word: { type: 'STRING' },
-          startTime: { type: 'NUMBER' },
-          endTime: { type: 'NUMBER' },
+          word: {
+            type: 'STRING',
+            description: 'The exact verbatim word from the lyric sheet.'
+          },
+          startTime: {
+            type: 'NUMBER',
+            description: 'Absolute timestamp in seconds from the beginning of the audio track (e.g., 14.240).'
+          },
+          endTime: {
+            type: 'NUMBER',
+            description: 'Absolute timestamp in seconds when the pronunciation of the word finishes.'
+          },
+          isVerbalSpeech: {
+            type: 'BOOLEAN',
+            description: 'Set to false ONLY if this timing block represents instrumental space or non-verbal humming tracks. Set to true for all actual spoken or sung lyrics.'
+          }
         },
-        required: ['word', 'startTime', 'endTime'],
+        required: ['word', 'startTime', 'endTime', 'isVerbalSpeech'],
       },
     };
 
