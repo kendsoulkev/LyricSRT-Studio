@@ -66,7 +66,8 @@ app.post("/api/forced-align-words", async (req, res) => {
 // Dedicated Forced-Alignment Word & Line endpoint using Gemini
 app.post("/api/precise-word-alignment", async (req, res) => {
   try {
-    const { audioBase64, referenceLyrics, mode = "word", modelName = "gemini-3.7-flash" } = req.body;
+    const { audioBase64, referenceLyrics, mode = "word", modelName = "gemini-3.7-flash", debugLabel = "" } = req.body;
+    const logTag = debugLabel ? ` [${debugLabel}]` : '';
     if (!audioBase64 || !referenceLyrics) {
       return res.status(400).json({ error: "Missing audioBase64 or referenceLyrics." });
     }
@@ -208,6 +209,11 @@ CRITICAL RULES FOR ACCURACY:
 
     let alignedData: any[] = [];
     let lastError: any = null;
+    // True when every Gemini candidate model failed (quota/availability) and we fell back
+    // to the naive whole-span proportional/syllable-weight distribution below, which has no
+    // real acoustic basis at all - the client needs to know this so it doesn't mistake a
+    // well-formed but low-quality guess for a genuine alignment result.
+    let usedProportionalFallback = false;
 
     const promptText = isMicroChunkMode
       ? `Here is the single lyric line to align to this short audio clip with millisecond precision:\n\n${referenceLyrics}`
@@ -216,8 +222,12 @@ CRITICAL RULES FOR ACCURACY:
       : `Here is the exact reference lyrics to align line-by-line with the provided audio wave file:\n\n${referenceLyrics}`;
 
     for (const candidate of candidateModels) {
-      // Try candidate model
-      for (let attempt = 1; attempt <= 2; attempt++) {
+      // Single attempt per candidate, not two: retrying the SAME model after a brief 500ms
+      // pause rarely succeeds when it's genuinely busy/quota-exhausted, and doubling the
+      // request count per candidate was a major contributor to both very long total run
+      // times and burning through daily quota in just one or two runs. Move on to the next
+      // candidate immediately instead.
+      for (let attempt = 1; attempt <= 1; attempt++) {
         try {
           const response = await ai.models.generateContent({
             model: candidate,
@@ -247,6 +257,7 @@ CRITICAL RULES FOR ACCURACY:
 
           if (response && response.text) {
             alignedData = JSON.parse(response.text.trim());
+            console.log(`Model ${candidate} succeeded.${logTag}`);
             break;
           }
         } catch (err: any) {
@@ -255,12 +266,12 @@ CRITICAL RULES FOR ACCURACY:
           const isRateLimited = err?.status === "RESOURCE_EXHAUSTED" || err?.code === 429 || String(err?.message || "").includes("429");
           
           if (isUnavailable && attempt === 1) {
-            console.log(`Model ${candidate} is temporarily busy (503), retrying with backoff...`);
+            console.log(`Model ${candidate} is temporarily busy (503), retrying with backoff...${logTag}`);
             await new Promise((resolve) => setTimeout(resolve, 500));
             continue;
           }
 
-          console.log(`Model ${candidate} not available (${isRateLimited ? 'quota exhausted' : 'busy'}), switching to next candidate...`);
+          console.log(`Model ${candidate} not available (${isRateLimited ? 'quota exhausted' : 'busy'}), switching to next candidate...${logTag}`);
           break; // move to next candidate model immediately
         }
       }
@@ -273,6 +284,7 @@ CRITICAL RULES FOR ACCURACY:
     // If Gemini models are experiencing high demand / outages, fall back to phonetic acoustic alignment
     if (alignedData.length === 0) {
       console.log("Gemini models busy, activating server acoustic-phonetic alignment.");
+      usedProportionalFallback = true;
       const pcmData = decodeWavBase64(audioBase64);
       const duration = pcmData?.duration || 180;
       const detectedOnset = Math.max(0.5, detectGlobalVocalOnset(pcmData));
@@ -339,7 +351,7 @@ CRITICAL RULES FOR ACCURACY:
     }
 
     if (isMicroChunkMode) {
-      return res.json(alignedData);
+      return res.json({ data: alignedData, usedProportionalFallback });
     }
 
     return res.json({
@@ -348,6 +360,7 @@ CRITICAL RULES FOR ACCURACY:
       words: isWordMode ? alignedData : undefined,
       items: !isWordMode ? alignedData : undefined,
       data: alignedData,
+      usedProportionalFallback,
     });
   } catch (err: any) {
     console.error("Error in /api/precise-word-alignment:", err);
@@ -431,7 +444,9 @@ Return strictly chronological, non-overlapping timestamps for all ${inputLines.l
 
     for (const modelName of candidateModels) {
       let succeeded = false;
-      for (let attempt = 1; attempt <= 2; attempt++) {
+      // Same reasoning as the word-alignment endpoint above: one attempt per candidate
+      // instead of two, to cut down total request count/time when models are busy.
+      for (let attempt = 1; attempt <= 1; attempt++) {
         try {
           const response = await ai.models.generateContent({
             model: modelName,
