@@ -348,6 +348,325 @@ export default function App() {
       setProgressStep(3);
 
       if (syncMode === 'word') {
+        // Lines are only a display grouping in Word-by-Word mode - they have no bearing on
+        // when a word should actually appear. The previous per-line pipeline still guessed
+        // line boundaries first (via Gemini) and then sliced/aligned words within each
+        // guessed line - word timing accuracy was capped by how good that separate,
+        // independently-variable line guess was. A single whole-file call removed that
+        // guessing stage, but sending an entire ~2.5-3 minute song as one audio payload
+        // turned out to be much more prone to timeouts/rate-limiting than the old small
+        // per-line requests were - trading one reliability problem for another. Split the
+        // difference: chunk the song into a handful of moderate-length, purely TIME-based
+        // windows (not AI-guessed line boundaries) with generous padding, and align each
+        // chunk's words in its own smaller, more reliable request.
+        setProgressText("Running whole-file word-level forced alignment in chunks (no line-boundary guessing)...");
+        setProgressPercent(40);
+
+        const fullReferenceText = parsedLines.join('\n');
+        const allWordsFlat = fullReferenceText.split(/\s+/).filter(Boolean);
+        const expectedWordCount = allWordsFlat.length;
+
+        let globalWordCues: SubtitleCue[] | null = null;
+
+        try {
+          const totalDuration = audioInfo?.duration || prep.analysis.lastVocalOffset || 180;
+          const onset = prep.analysis.firstVocalOnset ?? 0;
+          const offset = prep.analysis.lastVocalOffset ?? totalDuration;
+          const activeSpan = Math.max(5, offset - onset);
+
+          const TARGET_CHUNK_SECONDS = 35; // fewer, moderately larger chunks: this song's
+                                            // observed failures aren't about payload size
+                                            // (chunks succeed fine at this size once the
+                                            // model responds) - they're about the SHEER
+                                            // NUMBER of requests+retries needed against an
+                                            // already-congested service. Fewer chunks means
+                                            // less total retry/backoff overhead and less
+                                            // total wall-clock time.
+          const CHUNK_START_PADDING_SECONDS = 4; // start padding: unchanged, just needs to
+                                                   // avoid clipping the very beginning
+          const CHUNK_END_PADDING_SECONDS = 10;   // Widened from a symmetric 4 - the exact
+                                                   // rejection reason we now have proof of
+                                                   // ("count=59/68", a genuine ~9 word
+                                                   // shortfall, not tokenization noise) points
+                                                   // to real pacing variance: chunk 1 covers
+                                                   // the song's opening, which likely has a
+                                                   // slower singing pace than the song's
+                                                   // average, so its assigned words (split
+                                                   // evenly by count) genuinely take longer to
+                                                   // sing than an evenly-split time window
+                                                   // allows for - the tail end of the chunk's
+                                                   // words fall after the audio we're sending
+                                                   // actually ends. The shortfall is
+                                                   // specifically about running out of audio at
+                                                   // the END, not the start, so the extra
+                                                   // padding is asymmetric rather than
+                                                   // symmetric to target that directly.
+          const numChunks = Math.max(1, Math.ceil(activeSpan / TARGET_CHUNK_SECONDS));
+          const wordsPerChunk = Math.ceil(allWordsFlat.length / numChunks);
+
+          const decodedBuffer = await decodeAudioBlobToBuffer(audioInfo.blob);
+          const chunkWordArrays: ({ word: string; startTime: number; endTime: number }[] | null)[] =
+            new Array(numChunks).fill(null);
+          const chunkLastRejectionReason: (string | null)[] = new Array(numChunks).fill(null);
+
+          const attemptChunk = async (c: number, passLabel: string): Promise<{ word: string; startTime: number; endTime: number }[] | null> => {
+            const wordSlice = allWordsFlat.slice(c * wordsPerChunk, (c + 1) * wordsPerChunk);
+            if (wordSlice.length === 0) return [];
+
+            const estStart = onset + (c / numChunks) * activeSpan;
+            const estEnd = onset + ((c + 1) / numChunks) * activeSpan;
+            const paddedStart = Math.max(0, estStart - CHUNK_START_PADDING_SECONDS);
+            const paddedEnd = Math.min(totalDuration, estEnd + CHUNK_END_PADDING_SECONDS);
+
+            try {
+              const sliceResult = await sliceAudioBufferToBase64(decodedBuffer, paddedStart, paddedEnd);
+              const chunkBase64 = sliceResult.base64;
+              // sliceAudioBufferToBase64 adds its own extra ~250ms of padding before
+              // paddedStart when possible, so the returned audio's true absolute t=0 in the
+              // original song is actually paddedStart - actualStartPadding, not paddedStart
+              // itself. Use this (not paddedStart) when reconstructing absolute times below.
+              const chunkAudioAbsoluteStart = paddedStart - sliceResult.actualStartPadding;
+              const wordRes = await fetch('/api/precise-word-alignment', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  audioBase64: chunkBase64,
+                  referenceLyrics: wordSlice.join(' '),
+                  mode: 'word',
+                  debugLabel: `chunk ${c + 1}/${numChunks}, ${passLabel}`,
+                }),
+              });
+              const wordData = await wordRes.json();
+              const chunkWords: any[] = Array.isArray(wordData) ? wordData : (wordData.words || wordData.data || []);
+
+              if (!Array.isArray(chunkWords) || chunkWords.length === 0) {
+                throw new Error(`No word data returned for chunk ${c + 1}.`);
+              }
+              if (wordData?.usedProportionalFallback) {
+                throw new Error(`Chunk ${c + 1}: AI unavailable, server used a proportional guess - rejecting.`);
+              }
+
+              const startsAreDistinct = new Set(chunkWords.map((w: any) => w.startTime)).size > 1;
+              const isMonotonic = chunkWords.every((w: any, idx: number) =>
+                idx === 0 || (typeof w.startTime === 'number' && w.startTime >= chunkWords[idx - 1].startTime)
+              );
+              const countRatio = wordSlice.length > 0 ? chunkWords.length / wordSlice.length : 1;
+              // Tightened from 0.85-1.15: that was loose enough to let a chunk that silently
+              // dropped ~15% of its requested words (e.g. a whole repeated phrase the model
+              // skipped) pass as "reasonable". A single missing word permanently misaligns
+              // every word after it against the wrong reference index for the rest of the
+              // song - far worse than falling back locally for just this one chunk - so this
+              // needs to be strict.
+              // We now have direct proof (via chunk/pass-tagged logs) that chunk 1's server
+              // call succeeded on every single attempt across 3 separate passes, yet was
+              // rejected every time and fell back locally anyway - meaning validation, not
+              // the AI, was the actual failure point. 0.97-1.03 was tightened specifically to
+              // catch a real 9-word (~15%) drop, but is almost certainly also rejecting
+              // harmless minor tokenization differences (contractions, hyphens) that don't
+              // indicate a real problem. Loosen to a middle ground that still catches a
+              // genuine large drop but tolerates a couple of words of natural variance.
+              const countIsReasonable = countRatio >= 0.90 && countRatio <= 1.10;
+
+              if (chunkWords.length > 1 && (!startsAreDistinct || !isMonotonic || !countIsReasonable)) {
+                throw new Error(`Chunk ${c + 1}: unreliable timings (distinct=${startsAreDistinct}, monotonic=${isMonotonic}, count=${chunkWords.length}/${wordSlice.length}).`);
+              }
+
+              return chunkWords.map((w: any) => ({
+                word: w.word,
+                // The chunk's returned times are relative to where the sliced audio actually
+                // begins (chunkAudioAbsoluteStart, which already accounts for
+                // sliceAudioBufferToBase64's own extra padding) - add that offset back to get
+                // absolute song time.
+                startTime: +(chunkAudioAbsoluteStart + Number(w.startTime)).toFixed(3),
+                endTime: +(chunkAudioAbsoluteStart + Number(w.endTime > w.startTime ? w.endTime : w.startTime + 0.15)).toFixed(3),
+              }));
+            } catch (chunkErr) {
+              console.warn(`Word chunk ${c + 1}/${numChunks} (${passLabel}) failed or was unreliable:`, chunkErr);
+              chunkLastRejectionReason[c] = chunkErr instanceof Error ? chunkErr.message : String(chunkErr);
+              return null;
+            }
+          };
+
+          // First pass over every chunk.
+          for (let c = 0; c < numChunks; c++) {
+            setProgressText(`Aligning word chunk ${c + 1} of ${numChunks}...`);
+            setProgressPercent(35 + Math.round((c / numChunks) * 30));
+            chunkWordArrays[c] = await attemptChunk(c, 'pass 1 (first pass)');
+          }
+
+          // Chunks that failed the first pass are very often victims of a transient burst of
+          // model unavailability rather than anything wrong with that chunk specifically -
+          // several other chunks in this same run typically succeed despite similar "busy"
+          // errors. A 2-second pause wasn't long enough to matter against real rate-limit
+          // windows (which are often tens of seconds) - give it a real chance to clear before
+          // spending more requests on the same still-congested window.
+          const failedIndices = chunkWordArrays
+            .map((r, idx) => (r === null ? idx : -1))
+            .filter((idx) => idx >= 0);
+
+          if (failedIndices.length > 0) {
+            setProgressText(`Retrying ${failedIndices.length} chunk(s) that were unavailable on the first pass...`);
+            // 20s wasn't earning its cost: quota-exhaustion errors (as opposed to transient
+            // "busy" ones) don't clear in 20 seconds, so this was often just pure added wait
+            // time on top of an already-long run without actually improving the outcome.
+            await new Promise((resolve) => setTimeout(resolve, 8000));
+            for (const c of failedIndices) {
+              setProgressText(`Retrying word chunk ${c + 1} of ${numChunks}...`);
+              chunkWordArrays[c] = await attemptChunk(c, 'pass 2 (retry pass)');
+            }
+          }
+
+          // Chunk 1 specifically has failed on every test run across many separate days now
+          // (even ones where every other chunk succeeded easily), so this isn't just random
+          // bad luck evenly spread across chunks - something about being first in the queue
+          // consistently disadvantages it. It also anchors the song's opening, where the
+          // local fallback is known to be weakest (the intro's real vocal onset is often too
+          // quiet to distinguish from silence against the rest of the song's peak volume).
+          // Give it one more dedicated attempt, after everything else has already completed
+          // and with extra wait time, before accepting the fallback for it specifically.
+          if (chunkWordArrays[0] === null) {
+            setProgressText(`Chunk 1 (song opening) still unavailable - giving it one more dedicated retry...`);
+            await new Promise((resolve) => setTimeout(resolve, 15000));
+            chunkWordArrays[0] = await attemptChunk(0, 'pass 3 (dedicated chunk-1 retry)');
+          }
+
+          const chunkResults: { word: string; startTime: number; endTime: number }[] = [];
+          for (let c = 0; c < numChunks; c++) {
+            const wordSlice = allWordsFlat.slice(c * wordsPerChunk, (c + 1) * wordsPerChunk);
+            if (wordSlice.length === 0) continue;
+
+            if (chunkWordArrays[c]) {
+              chunkResults.push(...chunkWordArrays[c]!);
+            } else {
+              // Still unavailable after the retry pass - fall back locally for ONLY this
+              // chunk's word range, using its own small estimated span. Bounded, contained
+              // error instead of losing the whole song.
+              const estStart = onset + (c / numChunks) * activeSpan;
+              const estEnd = onset + ((c + 1) / numChunks) * activeSpan;
+              const localFallback = distributeTimePhoneticallyWithDecay(wordSlice, estStart, estEnd, true);
+              localFallback.forEach((w: any) => {
+                chunkResults.push({ word: w.word, startTime: w.startTime, endTime: w.endTime });
+              });
+            }
+          }
+
+          if (chunkResults.length === 0) {
+            throw new Error("No word chunks produced any data.");
+          }
+
+          // Directly settle exactly which chunks came from real AI alignment vs the local
+          // fallback, instead of inferring it from output statistics after the fact.
+          const aiSucceededCount = chunkWordArrays.filter((r) => r !== null).length;
+          const fallbackCount = numChunks - aiSucceededCount;
+          const fallbackChunkNumbers = chunkWordArrays
+            .map((r, idx) => (r === null ? idx + 1 : null))
+            .filter((n): n is number => n !== null);
+          console.log(
+            `[ChunkProvenance] ${aiSucceededCount}/${numChunks} chunks used real AI alignment. ` +
+            `${fallbackCount}/${numChunks} used the local fallback` +
+            (fallbackChunkNumbers.length > 0 ? ` (chunk numbers: ${fallbackChunkNumbers.join(', ')})` : '') + '.'
+          );
+
+          // Save this as an actual downloaded file rather than a toast the person has to
+          // catch in time - a toast disappears in seconds, a file sits in Downloads until
+          // they open it.
+          const reportLines = [
+            `LyricSRT Studio - Word Alignment Chunk Report`,
+            `Generated: ${new Date().toISOString()}`,
+            `Total chunks: ${numChunks}`,
+            `AI-aligned: ${aiSucceededCount}/${numChunks}`,
+            `Local fallback: ${fallbackCount}/${numChunks}` +
+              (fallbackChunkNumbers.length > 0 ? ` (chunk numbers: ${fallbackChunkNumbers.join(', ')})` : ''),
+            ``,
+            `Per-chunk detail:`,
+            ...chunkWordArrays.map((r, idx) =>
+              r !== null
+                ? `  Chunk ${idx + 1}: AI SUCCESS`
+                : `  Chunk ${idx + 1}: LOCAL FALLBACK` +
+                  (chunkLastRejectionReason[idx] ? ` - last rejection reason: ${chunkLastRejectionReason[idx]}` : ' - no attempt reached (song too short for this chunk index)')
+            ),
+          ];
+          const reportBlob = new Blob([reportLines.join('\n')], { type: 'text/plain' });
+          const reportUrl = URL.createObjectURL(reportBlob);
+          const reportLink = document.createElement('a');
+          reportLink.href = reportUrl;
+          reportLink.download = `sync-chunk-report-${Date.now()}.txt`;
+          document.body.appendChild(reportLink);
+          reportLink.click();
+          document.body.removeChild(reportLink);
+          URL.revokeObjectURL(reportUrl);
+
+          // Enforce monotonic ordering across chunk boundaries (independent chunk requests
+          // could, in rare cases, disagree slightly at the seam).
+          let prevEnd = 0;
+          chunkResults.forEach((w) => {
+            if (w.startTime < prevEnd) w.startTime = prevEnd;
+            if (w.endTime <= w.startTime) w.endTime = w.startTime + 0.12;
+            prevEnd = w.endTime;
+          });
+
+          globalWordCues = chunkResults.map((w, idx) => ({
+            id: `word-cue-${idx + 1}-${Date.now()}`,
+            index: idx + 1,
+            text: w.word,
+            startTime: w.startTime,
+            endTime: w.endTime,
+            words: [{ word: w.word, startTime: w.startTime, endTime: w.endTime }],
+          }));
+
+          // The AI's own alignment tends to drift slowly through a continuous unbroken
+          // phrase and re-anchor at natural pauses between lines (a known characteristic of
+          // model-based forced alignment) - visible as timing error that grows across a line
+          // then resets. refineWordTimestampsWithVocalOnsets cross-checks each word against
+          // the actual audio waveform (not the AI's own internal timing), which can catch and
+          // correct exactly this kind of drift. It was already built for the old per-line
+          // pipeline but was never wired into this newer chunked path - do that now as a
+          // final correction pass over the AI's output.
+          if (ENABLE_WORD_ONSET_REFINEMENT) {
+            try {
+              const vocalSegments = prep.analysis.vocalSegments || [];
+              globalWordCues = refineWordTimestampsWithVocalOnsets(globalWordCues, decodedBuffer, vocalSegments);
+            } catch (refineErr) {
+              console.warn('Post-alignment onset refinement failed, using unrefined AI timings:', refineErr);
+            }
+          }
+
+          (globalWordCues as any).__chunkProvenance = { aiSucceededCount, fallbackCount, fallbackChunkNumbers, numChunks };
+        } catch (globalErr) {
+          console.warn(
+            "Chunked whole-file word alignment unavailable, falling back to the per-line pipeline:",
+            globalErr
+          );
+          globalWordCues = null;
+        }
+
+        if (globalWordCues) {
+          setProgressStep(4);
+          setProgressText("Finalizing zero-drift subtitle cues & acoustic onsets...");
+          setProgressPercent(100);
+          setCues(globalWordCues);
+          setInitialAlignmentDone(true);
+          setFirstLineManuallySet(false);
+          setFirstLineAnchor(null);
+
+          const finishedCount = globalWordCues.length;
+          const provenance = (globalWordCues as any).__chunkProvenance;
+          const provenanceText = provenance
+            ? ` (AI: ${provenance.aiSucceededCount}/${provenance.numChunks} chunks` +
+              (provenance.fallbackCount > 0 ? `, local fallback: chunk(s) ${provenance.fallbackChunkNumbers.join(', ')}` : ', all chunks AI-aligned') +
+              `)`
+            : '';
+          setTimeout(() => {
+            setIsProgressModalOpen(false);
+            setSuccessToast(`Success: whole-file word alignment across ${finishedCount} word nodes${provenanceText}!`);
+            setTimeout(() => setSuccessToast(null), 8000);
+          }, 500);
+          return;
+        }
+
+        // ---- Fallback: the previous per-line pipeline, kept as a safety net for when the
+        // whole-file pass above is unavailable or returns unreliable data. Unchanged from
+        // before, including the collapse/monotonicity/onset-lag fixes already applied to it.
         setProgressText("Initiating high-precision phonetic micro-chunking pipeline...");
         setProgressPercent(40);
 
@@ -474,6 +793,16 @@ export default function App() {
 
             if (!Array.isArray(relativeWords) || relativeWords.length === 0) {
               throw new Error("No relative words returned");
+            }
+
+            // Same reasoning as the whole-file path above: a naive proportional guess (used
+            // when every AI model was unavailable) looks well-formed enough to otherwise pass
+            // the checks below, so reject it explicitly and let this line fall through to the
+            // phonetic-distribution fallback instead.
+            if (!Array.isArray(data) && data?.usedProportionalFallback) {
+              throw new Error(
+                `AI models were unavailable for line ${i + 1} (quota/rate-limited) - using phonetic fallback instead of an unreliable proportional guess.`
+              );
             }
 
             // Sanity-check the returned timings before trusting them. When the underlying
