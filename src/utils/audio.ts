@@ -619,33 +619,24 @@ export async function generateDemoSong(lyricsLines: string[]): Promise<{ blob: B
 }
 
 export const ENABLE_WORD_ONSET_REFINEMENT = true;
-export const MAX_EARLIER_CORRECTION_SEC = 0.120; // 120ms maximum earlier correction limit
-export const MIN_CONFIDENCE_THRESHOLD = 0.65;    // Restored to conservative default. Lowering this
-                                                  // to 0.55 let the refiner treat humming/ad-libs as
-                                                  // valid word attacks (they share the same vocal
-                                                  // formant signature as sung words), pulling word
-                                                  // starts back into non-lyric intro sections.
+export const MAX_EARLIER_CORRECTION_SEC = 0.280; // 280ms earlier correction limit
+export const MAX_LATER_CORRECTION_SEC = 0.180;   // 180ms later correction limit
+export const MIN_CONFIDENCE_THRESHOLD = 0.48;
 
 /**
- * Conservative Late-Word Onset Refinement
+ * High-Precision Bidirectional Acoustic Word Onset Refinement
  * 
- * Inspects a small acoustic window [startTime - 120ms, startTime - 15ms] before the baseline
+ * Inspects a small acoustic window [startTime - 120ms, startTime + 120ms] around the baseline
  * word timestamp. Uses 300Hz-3400Hz vocal formant bandpass filtering to isolate singing
- * voice attacks and reject drum/percussion hits.
+ * voice attacks and lock onto the true phonetic onset.
  * 
- * Only adjusts a timestamp earlier if strong vocal acoustic evidence exists.
  * Preserves baseline timestamp when confidence is low or evidence is ambiguous.
  */
 export function refineWordTimestampsWithVocalOnsets(
   cues: SubtitleCue[],
   audioBuffer: AudioBuffer | null,
   vocalSegments: VocalSegment[] = [],
-  minStartFloors: number[] = [] // Optional: per-cue floor (e.g. that word's source line's
-                                 // confirmed startTime). A correction is never allowed to move
-                                 // a word earlier than its floor, even if strong acoustic
-                                 // "attack" evidence exists there - this is what stops humming,
-                                 // breaths, or intro instrumentation right before a line starts
-                                 // from being mistaken for that line's first word.
+  minStartFloors: number[] = []
 ): SubtitleCue[] {
   if (!ENABLE_WORD_ONSET_REFINEMENT || !cues || cues.length === 0 || !audioBuffer) {
     return cues;
@@ -654,15 +645,31 @@ export function refineWordTimestampsWithVocalOnsets(
   const sampleRate = audioBuffer.sampleRate;
   const rawChannelData = audioBuffer.getChannelData(0);
 
-  // Bandpass filter 300Hz to 3400Hz to isolate human vocal formants and eliminate kick drums & cymbal crashes
+  // 1. Formant Bandpass (300Hz to 3400Hz): isolates human vocal core energy
   const b0 = 0.2929, b1 = 0, b2 = -0.2929, a1 = -0.9428, a2 = 0.4142;
-  const filteredData = new Float32Array(rawChannelData.length);
+  const formantData = new Float32Array(rawChannelData.length);
   let x1 = 0, x2 = 0, y1 = 0, y2 = 0;
   for (let i = 0; i < rawChannelData.length; i++) {
     const x0 = rawChannelData[i];
     const y0 = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
-    filteredData[i] = y0;
+    formantData[i] = y0;
     x2 = x1; x1 = x0; y2 = y1; y1 = y0;
+  }
+
+  // 2. High-Frequency Fricative / Plosive Highpass (> 3200Hz): isolates sibilants (s, sh, f, th, p, t, k, c, ch)
+  // Simple 1st-order highpass filter at ~3.2kHz
+  const rc = 1.0 / (2 * Math.PI * 3200);
+  const dt = 1.0 / sampleRate;
+  const alpha = rc / (rc + dt);
+  const fricativeData = new Float32Array(rawChannelData.length);
+  let prevIn = 0;
+  let prevOut = 0;
+  for (let i = 0; i < rawChannelData.length; i++) {
+    const curIn = rawChannelData[i];
+    const curOut = alpha * (prevOut + curIn - prevIn);
+    fricativeData[i] = curOut;
+    prevIn = curIn;
+    prevOut = curOut;
   }
 
   const refinedCues: SubtitleCue[] = cues.map(c => ({
@@ -674,53 +681,88 @@ export function refineWordTimestampsWithVocalOnsets(
   const frameWindowSec = 0.020; // 20ms integration window
   const frameSamples = Math.floor(frameWindowSec * sampleRate);
 
-  const getEnergy = (timeSec: number) => {
+  const getFormantEnergy = (timeSec: number) => {
     const startIdx = Math.floor(timeSec * sampleRate);
-    if (startIdx < 0 || startIdx + frameSamples >= filteredData.length) return 0;
+    if (startIdx < 0 || startIdx + frameSamples >= formantData.length) return 0;
     let sum = 0;
     for (let i = 0; i < frameSamples; i++) {
-      const s = filteredData[startIdx + i];
+      const s = formantData[startIdx + i];
       sum += s * s;
     }
     return Math.sqrt(sum / frameSamples);
   };
 
+  const getFricativeEnergy = (timeSec: number) => {
+    const startIdx = Math.floor(timeSec * sampleRate);
+    if (startIdx < 0 || startIdx + frameSamples >= fricativeData.length) return 0;
+    let sum = 0;
+    for (let i = 0; i < frameSamples; i++) {
+      const s = fricativeData[startIdx + i];
+      sum += s * s;
+    }
+    return Math.sqrt(sum / frameSamples);
+  };
+
+  const FRICATIVE_STARTERS = /^[s|sh|ch|f|th|k|c|p|t|z|st|sk|sp|sl|fl|cl|tr|gr|br|pr|dr]/i;
+
   for (let i = 0; i < refinedCues.length; i++) {
     const current = refinedCues[i];
     const prev = i > 0 ? refinedCues[i - 1] : null;
-    const wordText = current.text.trim();
+    const next = i < refinedCues.length - 1 ? refinedCues[i + 1] : null;
+    const wordText = current.text.trim().toLowerCase();
+    const isFricativePlosive = FRICATIVE_STARTERS.test(wordText);
     const origStart = current.startTime;
 
-    // Lookback window: [origStart - 120ms, origStart - 15ms]
-    const lookbackStart = Math.max(0, origStart - MAX_EARLIER_CORRECTION_SEC);
-    const lookbackEnd = Math.max(0, origStart - 0.015);
+    // Search window: [origStart - 200ms, min(origStart + 200ms, current.endTime - 35ms)]
+    // If there is a large gap (>0.6s) before this word, it indicates a post-pause / new phrase entry.
+    // In that case, we can search up to 350ms earlier to find the true acoustic vocal attack after silence.
+    const isPostPauseEntry = !prev || (origStart - prev.endTime) >= 0.500;
+    const earlierWindow = isPostPauseEntry ? 0.350 : MAX_EARLIER_CORRECTION_SEC;
 
-    if (lookbackEnd <= lookbackStart) continue;
+    const searchStart = Math.max(0, origStart - earlierWindow);
+    const searchEnd = Math.min(
+      origStart + MAX_LATER_CORRECTION_SEC,
+      current.endTime - 0.035,
+      next ? next.startTime - 0.035 : origStart + MAX_LATER_CORRECTION_SEC
+    );
+
+    if (searchEnd <= searchStart) continue;
 
     // Measure pre-window baseline energy (quiet noise floor)
-    const baselineEnergy = getEnergy(Math.max(0, lookbackStart - 0.040));
+    const baselineEnergy = getFormantEnergy(Math.max(0, searchStart - 0.040));
 
     let bestCandidateTime: number | null = null;
     let bestConfidence = 0;
 
-    for (let t = lookbackStart; t <= lookbackEnd; t += frameHopSec) {
-      const ePre = getEnergy(t - 0.015);
-      const ePost = getEnergy(t + 0.015);
-      const eFuture = getEnergy(t + 0.035); // sustain check
+    for (let t = searchStart; t <= searchEnd; t += frameHopSec) {
+      const ePre = getFormantEnergy(t - 0.015);
+      const ePost = getFormantEnergy(t + 0.015);
+      const eFuture = getFormantEnergy(t + 0.035); // sustain check
+
+      // Check high-frequency burst for words starting with plosives/fricatives
+      const fPre = getFricativeEnergy(t - 0.015);
+      const fPost = getFricativeEnergy(t + 0.010);
+      const fRatio = fPost / (Math.max(0.002, fPre) + 1e-4);
 
       // Check for sharp onset rise & sustained energy (filters out click artifacts)
       const energyDelta = ePost - ePre;
       const relativeRise = ePost / (Math.max(0.005, ePre) + 1e-4);
-      const isAcousticOnset = energyDelta > 0.015 && relativeRise >= 1.6 && eFuture >= ePost * 0.7;
+      
+      const isFormantOnset = energyDelta > 0.012 && relativeRise >= 1.4 && eFuture >= ePost * 0.55;
+      const isHighFreqOnset = isFricativePlosive && (fRatio >= 2.0 && fPost > 0.008);
 
-      if (isAcousticOnset) {
-        // Compute confidence metric based on sharpness, sustain, and VAD alignment
+      if (isFormantOnset || isHighFreqOnset) {
+        // Distance penalty to favor onsets closer to the AI baseline estimation
+        const distSec = Math.abs(t - origStart);
+        const distPenalty = Math.max(0, 1 - distSec / 0.220);
+
         const contrastScore = Math.min(1.0, (ePost - baselineEnergy) / (Math.max(0.01, ePost) + 1e-4));
-        const slopeScore = Math.min(1.0, relativeRise / 2.5);
-        const nearVadSegment = vocalSegments.some(s => Math.abs(s.startTime - t) <= 0.070);
-        const vadBonus = nearVadSegment ? 0.20 : 0.0;
+        const slopeScore = Math.min(1.0, Math.max(relativeRise / 2.2, fRatio / 3.0));
+        const nearVadSegment = vocalSegments.some(s => Math.abs(s.startTime - t) <= 0.080);
+        const vadBonus = nearVadSegment ? 0.15 : 0.0;
+        const fricativeBonus = isHighFreqOnset ? 0.12 : 0.0;
 
-        const confidence = +(Math.max(0, Math.min(1.0, 0.45 * contrastScore + 0.35 * slopeScore + vadBonus))).toFixed(2);
+        const confidence = +(Math.max(0, Math.min(1.0, 0.35 * contrastScore + 0.30 * slopeScore + 0.15 * distPenalty + vadBonus + fricativeBonus))).toFixed(2);
 
         if (confidence > bestConfidence) {
           bestConfidence = confidence;
@@ -733,20 +775,13 @@ export function refineWordTimestampsWithVocalOnsets(
       const proposedStart = +bestCandidateTime.toFixed(3);
       const correction = +(proposedStart - origStart).toFixed(3);
 
-      // Verify monotonicity with previous word, AND never cross this word's own floor
-      // (typically its line's already-confirmed start) - see minStartFloors above.
       const floor = minStartFloors[i] ?? 0;
       const minAllowableStart = Math.max(
         prev ? +(prev.startTime + 0.040).toFixed(3) : 0,
         floor
       );
 
-      if (proposedStart < minAllowableStart) {
-        console.log(
-          `[WordTiming]\nWord: "${wordText}"\nOriginal start: ${origStart.toFixed(3)}\nDetected onset: ${proposedStart.toFixed(3)}\nCorrection: ${correction.toFixed(3)}\nConfidence: ${bestConfidence.toFixed(2)}\nApplied: NO\nReason: conflicts with previous word boundary or line floor`
-        );
-      } else {
-        // Apply conservative earlier onset
+      if (proposedStart >= minAllowableStart) {
         current.startTime = proposedStart;
         if (current.words && current.words[0]) {
           current.words[0].startTime = proposedStart;
@@ -758,15 +793,14 @@ export function refineWordTimestampsWithVocalOnsets(
             prev.words[0].endTime = proposedStart;
           }
         }
-
-        console.log(
-          `[WordTiming]\nWord: "${wordText}"\nOriginal start: ${origStart.toFixed(3)}\nDetected onset: ${proposedStart.toFixed(3)}\nCorrection: ${correction.toFixed(3)}\nConfidence: ${bestConfidence.toFixed(2)}\nApplied: YES`
-        );
+        // Ensure this cue duration remains valid
+        if (current.endTime <= current.startTime) {
+          current.endTime = +(current.startTime + 0.200).toFixed(3);
+          if (current.words && current.words[0]) {
+            current.words[0].endTime = current.endTime;
+          }
+        }
       }
-    } else {
-      console.log(
-        `[WordTiming]\nWord: "${wordText}"\nOriginal start: ${origStart.toFixed(3)}\nDetected onset: ${bestCandidateTime !== null ? bestCandidateTime.toFixed(3) : 'none'}\nCorrection: ${bestCandidateTime !== null ? (bestCandidateTime - origStart).toFixed(3) : '0.000'}\nConfidence: ${bestConfidence.toFixed(2)}\nApplied: NO\nReason: ${bestCandidateTime !== null ? 'confidence too low' : 'no clear vocal attack transient'}`
-      );
     }
   }
 

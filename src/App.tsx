@@ -11,7 +11,7 @@ import { AlignmentProgressModal } from './components/AlignmentProgressModal';
 import { AudioTrackInfo, SubtitleCue, SyncMode, FirstLineAnchor } from './types';
 import { SAMPLE_LYRICS_PRESETS } from './data/sampleLyrics';
 import { prepareAudioForAi, extractWaveformPeaks, generateDemoSong, alignLyricsToVocalSegments, AudioAnalysisResult, sliceAudioBufferExact, sliceAudioBufferWithContext, sliceAudioBufferWithSilence, sliceAudioBufferToBase64, decodeAudioBlobToBuffer, refineWordTimestampsWithVocalOnsets, detectTrueSpeechOnset, ENABLE_WORD_ONSET_REFINEMENT } from './utils/audio';
-import { generateAccurateWordCuesFromLines, formatGeminiResponseToCues, distributeTimePhoneticallyWithDecay, snapAiWordsToLocalVad, applyLinguisticSmoothing, maskIntroHummingSegments, applyIntroSpeechGate } from './utils/srt';
+import { generateAccurateWordCuesFromLines, formatGeminiResponseToCues, distributeTimePhoneticallyWithDecay, snapAiWordsToLocalVad, applyLinguisticSmoothing, maskIntroHummingSegments, applyIntroSpeechGate, isSectionHeader } from './utils/srt';
 import { fetchPreciseWordAlignment } from './utils/gemini';
 import { AlertCircle, CheckCircle2, Music2, Sparkles, HelpCircle } from 'lucide-react';
 
@@ -362,8 +362,10 @@ export default function App() {
         setProgressText("Running whole-file word-level forced alignment in chunks (no line-boundary guessing)...");
         setProgressPercent(40);
 
-        const fullReferenceText = parsedLines.join('\n');
-        const allWordsFlat = fullReferenceText.split(/\s+/).filter(Boolean);
+        const fullReferenceText = parsedLines.filter((l) => !isSectionHeader(l)).join('\n');
+        const allWordsFlat = fullReferenceText
+          .split(/\s+/)
+          .filter((w) => Boolean(w) && !isSectionHeader(w));
         const expectedWordCount = allWordsFlat.length;
 
         let globalWordCues: SubtitleCue[] | null = null;
@@ -382,25 +384,8 @@ export default function App() {
                                             // already-congested service. Fewer chunks means
                                             // less total retry/backoff overhead and less
                                             // total wall-clock time.
-          const CHUNK_START_PADDING_SECONDS = 4; // start padding: unchanged, just needs to
-                                                   // avoid clipping the very beginning
-          const CHUNK_END_PADDING_SECONDS = 10;   // Widened from a symmetric 4 - the exact
-                                                   // rejection reason we now have proof of
-                                                   // ("count=59/68", a genuine ~9 word
-                                                   // shortfall, not tokenization noise) points
-                                                   // to real pacing variance: chunk 1 covers
-                                                   // the song's opening, which likely has a
-                                                   // slower singing pace than the song's
-                                                   // average, so its assigned words (split
-                                                   // evenly by count) genuinely take longer to
-                                                   // sing than an evenly-split time window
-                                                   // allows for - the tail end of the chunk's
-                                                   // words fall after the audio we're sending
-                                                   // actually ends. The shortfall is
-                                                   // specifically about running out of audio at
-                                                   // the END, not the start, so the extra
-                                                   // padding is asymmetric rather than
-                                                   // symmetric to target that directly.
+          const CHUNK_START_PADDING_SECONDS = 4; // 4s start padding: avoids excessive leading audio offset
+          const CHUNK_END_PADDING_SECONDS = 8;   // 8s end padding: captures phrase endings cleanly without over-extending span
           const numChunks = Math.max(1, Math.ceil(activeSpan / TARGET_CHUNK_SECONDS));
           const wordsPerChunk = Math.ceil(allWordsFlat.length / numChunks);
 
@@ -516,18 +501,18 @@ export default function App() {
             }
           }
 
-          // Chunk 1 specifically has failed on every test run across many separate days now
-          // (even ones where every other chunk succeeded easily), so this isn't just random
-          // bad luck evenly spread across chunks - something about being first in the queue
-          // consistently disadvantages it. It also anchors the song's opening, where the
-          // local fallback is known to be weakest (the intro's real vocal onset is often too
-          // quiet to distinguish from silence against the rest of the song's peak volume).
-          // Give it one more dedicated attempt, after everything else has already completed
-          // and with extra wait time, before accepting the fallback for it specifically.
-          if (chunkWordArrays[0] === null) {
-            setProgressText(`Chunk 1 (song opening) still unavailable - giving it one more dedicated retry...`);
-            await new Promise((resolve) => setTimeout(resolve, 15000));
-            chunkWordArrays[0] = await attemptChunk(0, 'pass 3 (dedicated chunk-1 retry)');
+          // If any chunks failed pass 2, give them a dedicated pass 3 with backoff
+          const stillFailedIndices = chunkWordArrays
+            .map((r, idx) => (r === null ? idx : -1))
+            .filter((idx) => idx >= 0);
+
+          if (stillFailedIndices.length > 0) {
+            setProgressText(`Retrying ${stillFailedIndices.length} chunk(s) with dedicated pass 3 retry...`);
+            await new Promise((resolve) => setTimeout(resolve, 6000));
+            for (const c of stillFailedIndices) {
+              setProgressText(`Dedicated retry for word chunk ${c + 1} of ${numChunks}...`);
+              chunkWordArrays[c] = await attemptChunk(c, `pass 3 (dedicated retry for chunk ${c + 1})`);
+            }
           }
 
           const chunkResults: { word: string; startTime: number; endTime: number }[] = [];
@@ -552,6 +537,28 @@ export default function App() {
 
           if (chunkResults.length === 0) {
             throw new Error("No word chunks produced any data.");
+          }
+
+          // Natural word duration capping & inter-word pause preservation:
+          // Individual sung words typically span 0.15s - 0.55s. Clamp overly stretched phrase-ending words
+          // so they don't linger across long musical rests.
+          for (let idx = 0; idx < chunkResults.length; idx++) {
+            const cur = chunkResults[idx];
+            const next = idx < chunkResults.length - 1 ? chunkResults[idx + 1] : null;
+            const dur = cur.endTime - cur.startTime;
+
+            if (next) {
+              const gap = next.startTime - cur.startTime;
+              if (gap > 0.60 && dur > 0.55) {
+                cur.endTime = +(cur.startTime + Math.min(dur, 0.55)).toFixed(3);
+              } else if (cur.endTime > next.startTime) {
+                cur.endTime = Math.max(cur.startTime + 0.10, +(next.startTime - 0.010).toFixed(3));
+              }
+            } else {
+              if (dur > 0.75) {
+                cur.endTime = +(cur.startTime + 0.75).toFixed(3);
+              }
+            }
           }
 
           // Directly settle exactly which chunks came from real AI alignment vs the local
@@ -671,6 +678,7 @@ export default function App() {
         setProgressPercent(40);
 
         // 1. Get Macro Line Anchors first
+        const activeLyricLines = parsedLines.filter((l) => !isSectionHeader(l));
         let lineAnchors: SubtitleCue[] = [];
         try {
           const lineRes = await fetch("/api/align-lyrics", {
@@ -680,7 +688,7 @@ export default function App() {
               audioBase64: prep.base64,
               mimeType: prep.mimeType,
               lyricsText,
-              lines: parsedLines,
+              lines: activeLyricLines,
               mode: 'line',
               audioDuration: audioInfo.duration,
               analysis: prep.analysis,
@@ -688,7 +696,7 @@ export default function App() {
           });
           const lineData = await lineRes.json();
           if (lineRes.ok && lineData.success && Array.isArray(lineData.items) && lineData.items.length > 0) {
-            lineAnchors = lineData.items;
+            lineAnchors = lineData.items.filter((item: SubtitleCue) => !isSectionHeader(item.text));
           }
         } catch (e) {
           console.log("Macro line scan using AI unavailable, using vocal onset anchors:", e);
@@ -696,14 +704,16 @@ export default function App() {
 
         // Fallback to vocal onset alignment if macro scan empty
         if (lineAnchors.length === 0) {
-          const rawVocalLines = alignLyricsToVocalSegments(parsedLines, prep.analysis, audioInfo.duration, 'line');
-          lineAnchors = rawVocalLines.map((l, idx) => ({
-            id: `line-anchor-${idx + 1}-${Date.now()}`,
-            index: l.index,
-            text: l.text,
-            startTime: l.startTime,
-            endTime: l.endTime,
-          }));
+          const rawVocalLines = alignLyricsToVocalSegments(activeLyricLines, prep.analysis, audioInfo.duration, 'line');
+          lineAnchors = rawVocalLines
+            .filter((l) => !isSectionHeader(l.text))
+            .map((l, idx) => ({
+              id: `line-anchor-${idx + 1}-${Date.now()}`,
+              index: l.index,
+              text: l.text,
+              startTime: l.startTime,
+              endTime: l.endTime,
+            }));
         }
 
         // Guard against bad/mismatched line anchors before they're used to slice audio and

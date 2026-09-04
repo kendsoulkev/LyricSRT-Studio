@@ -106,8 +106,11 @@ CRITICAL TIMING & VERBAL LAWS:
 
 CRITICAL TIMING & VERBAL LAWS:
 1. HUMMING IS NOT SPEECH: Do not map written words onto introductory humming, vocal ad-libs without text ("Mmmm", "Ooh", "Aah"), or instrumental sections.
-2. EXPLICIT ONSET REQUIREMENT: The "startTime" of the very first word must reflect the exact millisecond the first consonant sound is clearly formed by the speaker/singer (consonant attack onset). If the song has an instrumental or humming intro that lasts 12.4 seconds, your first word entry MUST NOT start before 12.400.
-3. GAP IDENTIFICATION: If there is a distinct musical pause or long sustained note fade between words, do not stretch the previous word artificially late. Allow absolute silence spaces to remain blank on the timeline.`;
+2. EXPLICIT ONSET REQUIREMENT: The "startTime" of each word must reflect the exact millisecond the leading consonant sound or initial vowel sound is clearly formed by the singer (true phonetic acoustic attack onset, not the middle of the vowel).
+3. PHRASE-PACING & ANTI-RUSHING LAW: In vocal singing tracks, words naturally space out to match musical measure beats. Do NOT rush or compress words into the front portion of a musical bar. Listen for the actual acoustic vowel burst of each individual word across the entire sung line.
+4. STRUCTURAL SECTION TIMINGS: When words belong to a new phrase or verse (e.g. after a pause), lock the start timestamp directly onto the singer's vocal attack after the breath/pause.
+5. TRUE ACOUSTIC WORD DURATION & GAPS: Output the true startTime (vocal attack) and endTime (vocal release/consonant closure) for each word. Typical sung word durations are 0.18s to 0.45s (or up to 0.65s for sustained vowels). Do not stretch words across silent inter-word breath gaps (0.10s to 0.30s) or across multi-second instrumental pauses between verses.
+6. COMPLETE COVERAGE: Return every requested word in sequence without dropping words or skipping lines.`;
 
     const systemInstruction = isMicroChunkMode
       ? chunkSystemInstruction
@@ -202,8 +205,10 @@ CRITICAL RULES FOR ACCURACY:
 
     const candidateModels = Array.from(new Set([
       modelName,
+      "gemini-2.5-flash",
       "gemini-3.7-flash",
       "gemini-flash-latest",
+      "gemini-2.5-pro",
       "gemini-3.1-flash-lite",
     ])).filter(Boolean);
 

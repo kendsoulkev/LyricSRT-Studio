@@ -59,6 +59,14 @@ export function formatDisplayTime(seconds: number): string {
 }
 
 /**
+ * Helper to identify bracketed section headers like [Verse 1], [Chorus], [Bridge], [Intro], etc.
+ */
+export function isSectionHeader(text: string): boolean {
+  if (!text) return false;
+  return /^\s*\[[\w\s\d\-.:]+\]\s*$/.test(text.trim());
+}
+
+/**
  * Generates valid SubRip (.srt) file content.
  * Supports line-by-line mode (1 cue per line) or word-by-word mode.
  */
@@ -66,13 +74,16 @@ export function generateSrt(cues: SubtitleCue[], mode: SyncMode = 'line'): strin
   if (!cues || cues.length === 0) return '';
 
   if (mode === 'word') {
-    // If word-by-word mode, we can generate a cue for every individual word with its own timestamp
+    // If word-by-word mode, we generate a cue for every individual word with its own timestamp
     let wordIndex = 1;
     const blocks: string[] = [];
 
     cues.forEach((cue) => {
+      if (isSectionHeader(cue.text)) return;
+
       if (cue.words && cue.words.length > 0) {
         cue.words.forEach((w) => {
+          if (isSectionHeader(w.word)) return;
           blocks.push(
             `${wordIndex}\n${formatSrtTimestamp(w.startTime)} --> ${formatSrtTimestamp(w.endTime)}\n${w.word}`
           );
@@ -89,14 +100,17 @@ export function generateSrt(cues: SubtitleCue[], mode: SyncMode = 'line'): strin
     return blocks.join('\n\n');
   }
 
-  // Line-by-line mode: exactly 1 block per line
-  return cues
-    .map((cue, idx) => {
-      const index = idx + 1;
-      const timeStr = `${formatSrtTimestamp(cue.startTime)} --> ${formatSrtTimestamp(cue.endTime)}`;
-      return `${index}\n${timeStr}\n${cue.text}`;
-    })
-    .join('\n\n');
+  // Line-by-line mode: exactly 1 block per line (excluding section headers)
+  let lineIndex = 1;
+  const blocks: string[] = [];
+  cues.forEach((cue) => {
+    if (isSectionHeader(cue.text)) return;
+    const timeStr = `${formatSrtTimestamp(cue.startTime)} --> ${formatSrtTimestamp(cue.endTime)}`;
+    blocks.push(`${lineIndex}\n${timeStr}\n${cue.text}`);
+    lineIndex++;
+  });
+
+  return blocks.join('\n\n');
 }
 
 /**
@@ -110,8 +124,11 @@ export function generateVtt(cues: SubtitleCue[], mode: SyncMode = 'line'): strin
     let wordIndex = 1;
     const blocks: string[] = [];
     cues.forEach((cue) => {
+      if (isSectionHeader(cue.text)) return;
+
       if (cue.words && cue.words.length > 0) {
         cue.words.forEach((w) => {
+          if (isSectionHeader(w.word)) return;
           blocks.push(
             `${wordIndex}\n${formatVttTimestamp(w.startTime)} --> ${formatVttTimestamp(w.endTime)}\n${w.word}`
           );
@@ -126,13 +143,15 @@ export function generateVtt(cues: SubtitleCue[], mode: SyncMode = 'line'): strin
     });
     body = blocks.join('\n\n');
   } else {
-    body = cues
-      .map((cue, idx) => {
-        const index = idx + 1;
-        const timeStr = `${formatVttTimestamp(cue.startTime)} --> ${formatVttTimestamp(cue.endTime)}`;
-        return `${index}\n${timeStr}\n${cue.text}`;
-      })
-      .join('\n\n');
+    let lineIndex = 1;
+    const blocks: string[] = [];
+    cues.forEach((cue) => {
+      if (isSectionHeader(cue.text)) return;
+      const timeStr = `${formatVttTimestamp(cue.startTime)} --> ${formatVttTimestamp(cue.endTime)}`;
+      blocks.push(`${lineIndex}\n${timeStr}\n${cue.text}`);
+      lineIndex++;
+    });
+    body = blocks.join('\n\n');
   }
 
   return `WEBVTT\n\n${body}`;
@@ -143,15 +162,21 @@ export function generateVtt(cues: SubtitleCue[], mode: SyncMode = 'line'): strin
  */
 export function generateLrc(cues: SubtitleCue[], title = 'Lyrics'): string {
   const header = `[ti:${title}]\n[re:LyricSRT Studio]\n[ve:1.0]\n\n`;
-  const lines = cues.map((cue) => {
+  const lines: string[] = [];
+
+  cues.forEach((cue) => {
+    if (isSectionHeader(cue.text)) return;
+
     if (cue.words && cue.words.length > 0) {
       // Enhanced LRC with word timestamps
       const wordPart = cue.words
+        .filter((w) => !isSectionHeader(w.word))
         .map((w) => `${formatLrcTimestamp(w.startTime)}${w.word}`)
         .join(' ');
-      return wordPart;
+      if (wordPart) lines.push(wordPart);
+    } else {
+      lines.push(`${formatLrcTimestamp(cue.startTime)}${cue.text}`);
     }
-    return `${formatLrcTimestamp(cue.startTime)}${cue.text}`;
   });
 
   return header + lines.join('\n');
@@ -193,24 +218,27 @@ Style: Karaoke,Arial,32,&H00FFFFFF,&H0000D7FF,&H00000000,&H80000000,-1,0,0,0,100
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 `;
 
-  const dialogueLines = cues.map((cue) => {
-    const startStr = formatAssTimestamp(cue.startTime);
-    const endStr = formatAssTimestamp(cue.endTime);
+  const dialogueLines = cues
+    .filter((cue) => !isSectionHeader(cue.text))
+    .map((cue) => {
+      const startStr = formatAssTimestamp(cue.startTime);
+      const endStr = formatAssTimestamp(cue.endTime);
 
-    if (cue.words && cue.words.length > 0) {
-      // Build Karaoke string with {\k<centiseconds>} per word
-      const kText = cue.words
-        .map((w) => {
-          const durationCs = Math.max(1, Math.round((w.endTime - w.startTime) * 100));
-          return `{\\k${durationCs}}${w.word}`;
-        })
-        .join(' ');
+      if (cue.words && cue.words.length > 0) {
+        // Build Karaoke string with {\k<centiseconds>} per word
+        const kText = cue.words
+          .filter((w) => !isSectionHeader(w.word))
+          .map((w) => {
+            const durationCs = Math.max(1, Math.round((w.endTime - w.startTime) * 100));
+            return `{\\k${durationCs}}${w.word}`;
+          })
+          .join(' ');
 
-      return `Dialogue: 0,${startStr},${endStr},Karaoke,,0,0,0,,${kText}`;
-    }
+        return `Dialogue: 0,${startStr},${endStr},Karaoke,,0,0,0,,${kText}`;
+      }
 
-    return `Dialogue: 0,${startStr},${endStr},Default,,0,0,0,,${cue.text}`;
-  });
+      return `Dialogue: 0,${startStr},${endStr},Default,,0,0,0,,${cue.text}`;
+    });
 
   return header + dialogueLines.join('\n');
 }
