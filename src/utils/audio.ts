@@ -212,8 +212,20 @@ export function analyzeVocalActivity(buffer: AudioBuffer): AudioAnalysisResult {
   const duration = buffer.duration;
   const segments = analyzeVocalActivityAdvanced(buffer);
 
-  const firstSignificantSegment = segments.find(s => (s.energy ?? 0) >= 0.15 && (s.endTime - s.startTime) >= 0.25) || segments[0];
-  const firstVocalOnset = firstSignificantSegment ? firstSignificantSegment.startTime : 1.5;
+  // Prefer a genuinely confident vocal onset over just "whatever segment came first". The
+  // previous version fell straight through to segments[0] - literally the earliest detected
+  // blip, however weak or short - the moment nothing met the strict energy+duration bar. For
+  // a track with a long quiet/instrumental intro, that lets a spurious early noise blip (far
+  // ahead of where singing actually starts) become the anchor for the entire local fallback
+  // distribution. Try progressively looser (but still real) criteria before ever falling back
+  // to "just take the first segment, full stop".
+  const tieredOnsetSegment =
+    segments.find(s => (s.energy ?? 0) >= 0.15 && (s.endTime - s.startTime) >= 0.25) ||
+    segments.find(s => (s.energy ?? 0) >= 0.15) ||
+    segments.find(s => (s.energy ?? 0) >= 0.08 && (s.endTime - s.startTime) >= 0.25) ||
+    segments.find(s => (s.energy ?? 0) >= 0.08) ||
+    segments[0];
+  const firstVocalOnset = tieredOnsetSegment ? tieredOnsetSegment.startTime : 1.5;
   const lastVocalOffset = segments.length > 0 ? segments[segments.length - 1].endTime : Math.max(2, duration - 1.5);
   
   const avgPhraseDuration = segments.length > 0

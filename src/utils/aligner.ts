@@ -137,7 +137,11 @@ export async function alignAudioWordsLocally(
 
     const maxEnergy = Math.max(...frameEnergies, 0.0001);
     const upperThreshold = maxEnergy * 0.14;
-    const lowerThreshold = maxEnergy * 0.04;
+    // Lowered from 0.04 - the backtrack below stops as soon as energy drops under this
+    // threshold, so a higher floor means it stops backtracking before it reaches the true
+    // start of a soft/gradual vocal attack, leaving the detected onset a bit late. A lower
+    // floor lets it walk back further into the actual attack ramp before giving up.
+    const lowerThreshold = maxEnergy * 0.025;
 
     interface AudioPeak {
       startSec: number;
@@ -229,7 +233,13 @@ export async function alignAudioWordsLocally(
             bestFrame = s;
           }
         }
-        endFrame = bestFrame;
+        // Guarantee forward progress: without this floor, a single dominant transient
+        // spike anywhere within the (wide, clip-wide-percentage) search window can win
+        // the "highest flux" comparison for many words in a row, repeatedly snapping
+        // endFrame back near that one spike regardless of where startFrame has already
+        // advanced to - collapsing every word after it toward the same timestamp instead
+        // of progressing through the line.
+        endFrame = Math.max(startFrame + 1, bestFrame);
       }
 
       currentFrame = endFrame;
